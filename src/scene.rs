@@ -2,7 +2,7 @@
 //! mirror floor is the same geometry re-projected with y flipped (no extra pass).
 
 use crate::brand::{self, Role};
-use crate::sim::{trace, Packet, Scenario, Sim, Team, ARENA_X, ARENA_Z0, ARENA_Z1, EMERGE_CELL, EMERGE_MARK_W, EMERGE_ZB, FLAT_ZB, MARK_Y, MARK_Z};
+use crate::sim::{trace, Packet, Scenario, Shape, Sim, Team, ARENA_X, ARENA_Z0, ARENA_Z1, EMERGE_CELL, EMERGE_MARK_W, EMERGE_ZB, FLAT_ZB, MARK_Y, MARK_Z};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use std::collections::HashMap;
@@ -1075,22 +1075,47 @@ let zp = eye.z + 520.0 - 330.0 * prog;
             }
         }
 
-        // derezzed voxels
+        // derezzed debris: cubes from light cycles; triangles, prisms, slabs and cubes from the event trails
         for s in &sim.shards {
             let q = Quat::from_axis_angle(s.axis, s.ang);
-            let (ex, ez) = (q * Vec3::X * s.size, q * Vec3::Z * s.size);
+            let (ex, ey, ez) = (q * Vec3::X * s.size, q * Vec3::Y * s.size, q * Vec3::Z * s.size);
             let a = (s.life / s.max * 2.2).min(1.0) * 0.55;
             let dig = ((1.0 - s.life / s.max - 0.15) / 0.5).clamp(0.0, 1.0);
             let sc = s.color.lerp(Vec3::new(0.35, 0.65, 1.0), dig);
             let c = Vec4::new(sc.x, sc.y, sc.z, a);
-            p.push(
-                Layer::Add,
-                true,
-                [s.p - ex - ez, s.p + ex - ez, s.p + ex + ez, s.p - ex + ez],
-                [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]],
-                [c; 4],
-                K_SHARD,
-            );
+            // a lit-edged face spanned by u and v around its centre
+            let face = |p: &mut Painter, m: Vec3, u: Vec3, v: Vec3, c: Vec4| {
+                p.push(Layer::Add, true, [m - u - v, m + u - v, m + u + v, m - u + v], [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], [c; 4], K_SHARD);
+            };
+            match s.shape {
+                Shape::Rect => face(&mut p, s.p, ex * 1.9, ez * 0.55, c),
+                Shape::Cube => {
+                    let (hx, hy, hz) = (ex * 0.62, ey * 0.62, ez * 0.62);
+                    let cf = c * Vec4::new(1.0, 1.0, 1.0, 0.55); // six faces overlap: each one dimmer
+                    for (n, u, v) in [(hx, hy, hz), (hy, hz, hx), (hz, hx, hy)] {
+                        face(&mut p, s.p + n, u, v, cf);
+                        face(&mut p, s.p - n, u, v, cf);
+                    }
+                }
+                Shape::Prism => {
+                    // triangular cross-section in the x/y plane, extruded along z
+                    let tri = [ey * 0.8, -ey * 0.4 + ex * 0.7, -ey * 0.4 - ex * 0.7];
+                    let half = ez * 0.9;
+                    let cf = c * Vec4::new(1.0, 1.0, 1.0, 0.7);
+                    for i in 0..3 {
+                        let (ta, tb) = (tri[i], tri[(i + 1) % 3]);
+                        face(&mut p, s.p + (ta + tb) * 0.5, (tb - ta) * 0.5, half, cf);
+                    }
+                }
+                Shape::Tri => {
+                    let t = [s.p + ey * 1.1, s.p - ey * 0.55 + ex * 0.95, s.p - ey * 0.55 - ex * 0.95];
+                    p.push(Layer::Add, true, tri4(t), [[0.0; 2]; 4], [c * Vec4::new(1.0, 1.0, 1.0, 0.25); 4], K_SOLID);
+                    let w = s.size * 0.16;
+                    for i in 0..3 {
+                        p.bar(Layer::Add, t[i], t[(i + 1) % 3], w, c, c, true);
+                    }
+                }
+            }
         }
 
         // ── HUD (Twinise editorial instrument) ──
@@ -1155,8 +1180,8 @@ let zp = eye.z + 520.0 - 330.0 * prog;
         // game readouts: kill feed (left) and camera / sector clock (right)
         let line_y = ly + fs * 1.5;
         if sim.scenario == Scenario::Arena {
-            for (i, (msg, life, team)) in sim.feed.iter().rev().enumerate() {
-                let c = team.color();
+            for (i, (msg, life, fc)) in sim.feed.iter().rev().enumerate() {
+                let c = *fc;
                 let a = (life / 1.5).min(1.0) * 0.9;
                 p.text(m, line_y + i as f32 * fs * 1.35, fs, msg, Vec4::new(c.x, c.y + 0.12, c.z + 0.05, a));
                 let _ = Team::Red;

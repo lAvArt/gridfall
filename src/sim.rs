@@ -282,7 +282,28 @@ fn seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     (p - (a + ab * t)).length()
 }
 
+/// The shape a piece of derezzed debris takes: cubes from light cycles, other solids from the event trails.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Shape {
+    Cube,
+    Prism,
+    Rect,
+    Tri,
+}
+
+impl Shape {
+    pub fn of_kind(k: Kind) -> Shape {
+        match k {
+            Kind::Star | Kind::Issue => Shape::Tri,
+            Kind::Fork | Kind::Pr => Shape::Prism,
+            Kind::Merge => Shape::Cube,
+            Kind::Push | Kind::Comment | Kind::Other => Shape::Rect,
+        }
+    }
+}
+
 pub struct Shard {
+    pub shape: Shape,
     pub p: Vec3,
     v: Vec3,
     pub axis: Vec3,
@@ -408,6 +429,8 @@ pub struct Streak {
     pub height: f32,
     /// set on the lead trail of an event: whose it is
     pub who: Option<String>,
+    /// whose event this trail belongs to (every trail of it)
+    pub owner: String,
     /// visible trail, tail → head
     pub pts: Vec<Vec2>,
     /// 1 while the head is travelling, falls to 0 as the trail drains into its end
@@ -438,7 +461,12 @@ fn path_cut(p: &[Vec2], d0: f32, d1: f32) -> Vec<Vec2> {
 
 impl Streak {
     fn new(path: Vec<Vec2>, kind: Kind, v: f32, accel: f32, vmax: f32, tail: f32, height: f32) -> Self {
-        Streak { path, s: 0.0, v, accel, vmax, delay: 0.0, tail, kind, height, who: None, pts: Vec::new(), live: 1.0 }
+        Streak { path, s: 0.0, v, accel, vmax, delay: 0.0, tail, kind, height, who: None, owner: String::new(), pts: Vec::new(), live: 1.0 }
+    }
+
+    /// The head, while it is still out on the grid (not waiting, not draining into its end).
+    pub fn moving_head(&self) -> Option<Vec2> {
+        (self.delay <= 0.0 && self.live >= 1.0 && self.pts.len() >= 2).then(|| *self.pts.last().unwrap())
     }
 
     fn step(&mut self, dt: f32) -> bool {
@@ -513,7 +541,8 @@ pub struct Sim {
     pub tron: f32,
     snap_cam: bool,
     pub kills: [u32; 2],
-    pub feed: Vec<(String, f32, Team)>,
+    /// kill feed: message, seconds left, colour
+    pub feed: Vec<(String, f32, Vec3)>,
     pub run_speed: f32,
     run_dist: f32,
     /// X of the sweeping scan front: the world at x < scan_x (screen-right) is digital, the rest physical.
@@ -622,7 +651,8 @@ impl Sim {
         self.cycles.iter().filter(|c| c.alive).count()
     }
 
-    fn derez(&mut self, idx: usize, killer: Option<usize>) {
+    /// `cause`: a kill-feed line (and its colour) to use instead of the default one.
+    fn derez(&mut self, idx: usize, killer: Option<usize>, cause: Option<(String, Vec3)>) {
         let victim_id = self.cycles[idx].id;
         let (team, head, pts) = {
             let c = &mut self.cycles[idx];
@@ -638,7 +668,7 @@ impl Sim {
             let dir = self.rng.unit();
             let sp = self.rng.range(3.0, 14.0);
             let v = Vec3::new(dir.x * sp, dir.y.abs() * sp * 0.9 + 3.0, dir.z * sp);
-            self.push_shard(h3, v, col, 0.32);
+            self.push_shard(h3, v, col, 0.32, Shape::Cube);
         }
         // Trail dissolves upward into voxels.
         let mut carry = 0.0;
@@ -650,18 +680,19 @@ impl Sim {
                 let p = a + (b - a) * (s / l.max(1e-4));
                 let v = Vec3::new(self.rng.range(-1.2, 1.2), self.rng.range(2.0, 9.0), self.rng.range(-1.2, 1.2));
                 let y = self.rng.range(0.1, 1.1);
-                self.push_shard(Vec3::new(p.x, y, p.y), v, col, 0.26);
+                self.push_shard(Vec3::new(p.x, y, p.y), v, col, 0.26, Shape::Cube);
                 s += 2.0;
             }
             carry = s - l;
         }
-        match killer {
-            Some(k) if k != idx => {
+        match (killer, cause) {
+            (_, Some((msg, c))) => self.feed.push((msg, 7.0, c)),
+            (Some(k), None) if k != idx => {
                 let kt = self.cycles[k].team;
                 self.kills[if kt == Team::Red { 0 } else { 1 }] += 1;
-                self.feed.push((format!("UNIT-{:02} DEREZZED UNIT-{:02}", self.cycles[k].id + 1, victim_id + 1), 7.0, kt));
+                self.feed.push((format!("UNIT-{:02} DEREZZED UNIT-{:02}", self.cycles[k].id + 1, victim_id + 1), 7.0, kt.color()));
             }
-            _ => self.feed.push((format!("UNIT-{:02} CRASHED", victim_id + 1), 7.0, team)),
+            _ => self.feed.push((format!("UNIT-{:02} CRASHED", victim_id + 1), 7.0, team.color())),
         }
         if self.feed.len() > 5 {
             self.feed.remove(0);
@@ -674,7 +705,51 @@ impl Sim {
         self.since_derez = 0.0;
     }
 
-    fn push_shard(&mut self, p: Vec3, v: Vec3, color: Vec3, size: f32) {
+    /// An event trail shatters: a burst at its head, and the trail rises off the floor as debris of the event's shape.
+    fn derez_streak(&mut self, si: usize, wall: Option<usize>) {
+        let st = self.streaks.remove(si);
+        let (col, shape) = (st.kind.color(), Shape::of_kind(st.kind));
+        let head = st.pts.last().copied().unwrap_or(Vec2::ZERO);
+        let h3 = Vec3::new(head.x, 0.5, head.y);
+        for _ in 0..22 {
+            let dir = self.rng.unit();
+            let sp = self.rng.range(3.0, 12.0);
+            let v = Vec3::new(dir.x * sp, dir.y.abs() * sp * 0.8 + 3.0, dir.z * sp);
+            self.push_shard(h3, v, col, 0.30, shape);
+        }
+        let mut carry = 0.0;
+        for w in st.pts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let l = (b - a).length();
+            let mut s = carry;
+            while s < l {
+                let p = a + (b - a) * (s / l.max(1e-4));
+                let v = Vec3::new(self.rng.range(-1.2, 1.2), self.rng.range(2.0, 8.0), self.rng.range(-1.2, 1.2));
+                let y = self.rng.range(0.1, 1.0);
+                self.push_shard(Vec3::new(p.x, y, p.y), v, col, 0.24, shape);
+                s += 2.4;
+            }
+            carry = s - l;
+        }
+        self.pulses.push(Pulse { o: head, r: 0.0, strength: 0.7, color: col });
+        let (msg, c) = match wall {
+            Some(j) => (format!("UNIT-{:02} CUT {}'S {}", self.cycles[j].id + 1, st.owner.to_uppercase(), st.kind.name()), self.cycles[j].team.color()),
+            None => (format!("{}'S {} DEREZZED", st.owner.to_uppercase(), st.kind.name()), col),
+        };
+        if std::env::var_os("GRIDFALL_DEBUG").is_some() {
+            eprintln!("gridfall: {msg}");
+        }
+        // the lanes of one push shatter one after another: one line for all of them
+        if self.feed.last().is_none_or(|f| f.0 != msg) {
+            self.feed.push((msg, 7.0, c));
+        }
+        if self.feed.len() > 5 {
+            self.feed.remove(0);
+        }
+        self.energy = (self.energy + 0.25).min(2.0);
+    }
+
+    fn push_shard(&mut self, p: Vec3, v: Vec3, color: Vec3, size: f32, shape: Shape) {
         if self.shards.len() >= MAX_SHARDS {
             return;
         }
@@ -684,6 +759,7 @@ impl Sim {
         let w = self.rng.range(-9.0, 9.0);
         let sz = size * self.rng.range(0.45, 1.0);
         self.shards.push(Shard {
+            shape,
             p,
             v,
             axis,
@@ -807,6 +883,13 @@ impl Sim {
                         }
                     }
                 }
+                // event trails are walls too
+                for st in &self.streaks {
+                    if st.pts.windows(2).any(|w| seg_dist(probe, w[0], w[1]) < 1.4) {
+                        danger = true;
+                        break 'look;
+                    }
+                }
             }
             if danger && !self.cycles[i].danger_prev {
                 self.cycles[i].react = self.rng.chance(0.82);
@@ -886,6 +969,39 @@ impl Sim {
                 }
             }
         }
+        // A light cycle riding into an event's trail derezzes; an event trail running into a light wall shatters.
+        let mut hit: Vec<(usize, usize)> = Vec::new(); // (cycle, streak)
+        for (i, a) in self.cycles.iter().enumerate() {
+            if !a.alive || (a.seeded && a.age < 1.6) || dead.iter().any(|d| d.0 == i) {
+                continue;
+            }
+            if let Some(si) = self.streaks.iter().position(|st| st.delay <= 0.0 && st.pts.windows(2).any(|w| seg_dist(a.pos, w[0], w[1]) < 0.6)) {
+                hit.push((i, si));
+            }
+        }
+        let mut cut: Vec<(usize, usize)> = Vec::new(); // (streak, cycle whose wall it hit)
+        for (si, st) in self.streaks.iter().enumerate() {
+            let Some(h) = st.moving_head() else { continue };
+            if let Some(j) = self.cycles.iter().position(|b| b.alive && b.pts.windows(2).any(|w| seg_dist(h, w[0], w[1]) < 0.6)) {
+                cut.push((si, j));
+            }
+        }
+        for (i, si) in hit {
+            if self.cycles[i].alive {
+                let st = &self.streaks[si];
+                let msg = format!("UNIT-{:02} HIT {}'S {}", self.cycles[i].id + 1, st.owner.to_uppercase(), st.kind.name());
+                let col = st.kind.color();
+                if std::env::var_os("GRIDFALL_DEBUG").is_some() {
+                    eprintln!("gridfall: {msg}");
+                }
+                self.derez(i, None, Some((msg, col)));
+            }
+        }
+        cut.sort_by(|x, y| y.0.cmp(&x.0));
+        for (si, j) in cut {
+            self.derez_streak(si, Some(j));
+        }
+
         // Keep the match lively if nothing has collided for a while.
         if dead.is_empty() && self.since_derez > 10.0 {
             let cand: Vec<usize> =
@@ -896,7 +1012,7 @@ impl Sim {
         }
         for (i, k) in dead {
             if self.cycles[i].alive {
-                self.derez(i, k);
+                self.derez(i, k, None);
             }
         }
     }
@@ -969,7 +1085,7 @@ impl Sim {
                     let a = self.rng.range(0.0, std::f32::consts::TAU);
                     let sp = self.rng.range(2.0, 6.0);
                     let up = self.rng.range(3.0, 7.0);
-                    self.push_shard(Vec3::new(x, 0.3, z), Vec3::new(a.cos() * sp, up, a.sin() * sp), col, 0.22);
+                    self.push_shard(Vec3::new(x, 0.3, z), Vec3::new(a.cos() * sp, up, a.sin() * sp), col, 0.22, Shape::of_kind(kind));
                 }
             }
             let age = if age_s < 0 {
@@ -1090,6 +1206,9 @@ impl Sim {
                 out.push(Streak::new(path.into_iter().map(|q| o + q - end).collect(), kind, 14.0, 0.0, 14.0, 56.0, 0.85));
             }
             Kind::Comment | Kind::Other => {}
+        }
+        for s in &mut out {
+            s.owner = who.to_string();
         }
         if let Some(first) = out.first_mut() {
             first.who = Some(who.to_string());

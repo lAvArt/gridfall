@@ -44,6 +44,10 @@ impl Kind {
             Kind::Other => Vec3::new(0.62, 0.64, 0.70),   // grey
         }
     }
+    /// Short name, as in the legend.
+    pub fn name(self) -> &'static str {
+        Kind::LEGEND.iter().find(|(k, _)| *k == self).map(|(_, n)| *n).unwrap_or("EVENT")
+    }
     /// Legend order and names.
     pub const LEGEND: [(Kind, &'static str); 7] =
         [(Kind::Star, "STAR"), (Kind::Fork, "FORK"), (Kind::Push, "PUSH"), (Kind::Pr, "PR"), (Kind::Merge, "MERGE"), (Kind::Comment, "COMMENT"), (Kind::Issue, "ISSUE")];

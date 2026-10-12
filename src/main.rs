@@ -165,11 +165,16 @@ impl Gfx {
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
+        if std::env::var_os("GRIDFALL_DEBUG").is_some() {
+            eprintln!("gridfall: surface formats {:?}", caps.formats);
+        }
         // Gamma-space blending gives the punchy, filmic additive glow we want.
         let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
-        // recording reads frames back as 8-bit BGRA/RGBA for ffmpeg
+        // The live window gets a float surface, which the compositor reads as linear light and gamma-encodes for the
+        // panel. A recording reads frames back as 8-bit BGRA/RGBA for ffmpeg: an sRGB surface applies that same
+        // encoding, so the video shows exactly what the screen does.
         let format = if capture {
-            caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm)).unwrap_or(format)
+            caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Rgba8UnormSrgb)).unwrap_or(format)
         } else {
             format
         };
@@ -211,7 +216,7 @@ impl Gfx {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm, // display values, like the swapchain: no sRGB decode
+                format: wgpu::TextureFormat::Rgba8UnormSrgb, // decoded to linear: the output is linear light (see the surface format)
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
@@ -647,6 +652,9 @@ impl App {
                         let pix = if matches!(fmt, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb) { "bgra" } else { "rgba" };
                         std::process::Command::new("ffmpeg")
                             .args(["-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix, "-s", &format!("{gw}x{gh}"), "-r", "60", "-i", "-"])
+                            // BT.709 conversion and tags: untagged video gets decoded as BT.709 by players while ffmpeg converts with
+                            // BT.601 by default, which shifts every hue
+                            .args(["-vf", "scale=out_color_matrix=bt709:out_range=tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"])
                             .args(["-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-profile:v", "high", "-movflags", "+faststart", &d.path])
                             .stdin(std::process::Stdio::piped())
                             .spawn()
