@@ -34,10 +34,12 @@ You'll need the Rust toolchain to build it once (`sudo pacman -S rust` if you do
 
 ```bash
 omarchy plugin add https://github.com/lAvArt/gridfall
-cd ~/.config/omarchy/plugins/io.github.lavart.gridfall
-cargo build --release
+cargo install --locked --path ~/.config/omarchy/plugins/io.github.lavart.gridfall
 omarchy plugin enable io.github.lavart.gridfall
 ```
+
+The middle step compiles Gridfall and puts it in `~/.cargo/bin`. It builds in a temporary folder, so nothing
+lands inside the plugin folder that Omarchy watches.
 
 That's it. Gridfall now runs after the same idle timeout as Omarchy's built-in screensaver (you can change it in
 `~/.config/omarchy/shell.json` under `idle.screensaver`). Press any key or move the mouse and you're back. Omarchy's
@@ -52,7 +54,7 @@ Want to see it straight away?
 Or run it in a window you can close with Esc:
 
 ```bash
-~/.config/omarchy/plugins/io.github.lavart.gridfall/target/release/gridfall --windowed
+~/.cargo/bin/gridfall --windowed
 ```
 
 One thing to know: while Gridfall is enabled it turns off Omarchy's stock terminal screensaver, otherwise you'd get
@@ -108,8 +110,8 @@ Gridfall can render straight to a video file, frame by frame at a fixed 60 fps, 
 however busy your machine is (needs `ffmpeg`):
 
 ```bash
-target/release/gridfall --dump loop.mp4 --secs 121 --size 1920x1080
-target/release/gridfall --record --dump arena.mp4 --secs 48     # just the arena, from every camera angle
+gridfall --dump loop.mp4 --secs 121 --size 1920x1080
+gridfall --record --dump arena.mp4 --secs 48     # just the arena, from every camera angle
 ```
 
 ## What it needs
@@ -121,10 +123,18 @@ target/release/gridfall --record --dump arena.mp4 --secs 48     # just the arena
 - `hyprctl`, `jq` and `notify-send`, which all ship with Omarchy
 - `ffmpeg`, but only if you want to record videos
 
+## Updating
+
+```bash
+omarchy plugin update io.github.lavart.gridfall
+cargo install --locked --path ~/.config/omarchy/plugins/io.github.lavart.gridfall
+```
+
 ## Removing it
 
 ```bash
 omarchy plugin remove io.github.lavart.gridfall
+cargo uninstall gridfall
 ```
 
 Removing or disabling Gridfall turns Omarchy's stock screensaver back on, if Gridfall was what turned it off. If you
