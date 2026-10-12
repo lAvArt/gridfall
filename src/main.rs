@@ -1,0 +1,805 @@
+//! Gridfall — the desktop falls into a light-cycle grid. A screensaver by lAvArt Studio.
+//! Tron: Ares–style grid world: GPU-rendered, CPU physics, ~one draw call per layer.
+
+mod brand;
+mod feed;
+mod scene;
+mod sim;
+
+use bytemuck::{Pod, Zeroable};
+use scene::{Scene, Vertex};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use wgpu::util::DeviceExt;
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Fullscreen, Window, WindowId};
+
+const MAX_QUADS: usize = 40_000;
+const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const APP_ID: &str = "org.omarchy.screensaver";
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Uniforms {
+    inv_vp: [[f32; 4]; 4],
+    eye: [f32; 4],
+    params: [f32; 4],
+    pulse: [[f32; 4]; 4],
+    pcol: [[f32; 4]; 4],
+    extra: [f32; 4],
+    /// the opening camera: pins the wallpaper to the floor exactly where it filled the first frame
+    wall_vp: [[f32; 4]; 4],
+    /// x: wallpaper opacity, y: wallpaper aspect (w/h), z: lAvArt hairline grid on (1/0), w: unused
+    wall: [f32; 4],
+}
+
+struct Gfx {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    floor: wgpu::RenderPipeline,
+    add: wgpu::RenderPipeline,
+    alpha: wgpu::RenderPipeline,
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    ubuf: wgpu::Buffer,
+    bind: wgpu::BindGroup,
+    post: Post,
+}
+
+/// Size-dependent post-processing resources (HDR scene + two-level bloom chain).
+struct Targets {
+    scene: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    passes: Vec<wgpu::BindGroup>, // down1, blurH1, blurV1, down2, blurH2, blurV2, comp
+    views: [wgpu::TextureView; 4], // L1A, L1B, L2A, L2B
+    /// composite settings: w = bloom suppression (while the real wallpaper is on screen)
+    u_comp: wgpu::Buffer,
+}
+
+struct Post {
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    down: wgpu::RenderPipeline,
+    blur: wgpu::RenderPipeline,
+    comp: wgpu::RenderPipeline,
+    t: Targets,
+}
+
+fn make_tex(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, w: u32, h: u32) -> Targets {
+    let (w1, h1) = ((w / 4).max(1), (h / 4).max(1));
+    let (w2, h2) = ((w1 / 4).max(1), (h1 / 4).max(1));
+    let scene = make_tex(device, w, h);
+    let depth = device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth"),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default());
+    let l1a = make_tex(device, w1, h1);
+    let l1b = make_tex(device, w1, h1);
+    let l2a = make_tex(device, w2, h2);
+    let l2b = make_tex(device, w2, h2);
+    let uni = |v: [f32; 4]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    };
+    let bg = |src: &wgpu::TextureView, u: &wgpu::Buffer, t1: &wgpu::TextureView, t2: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: u.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(t1) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(t2) },
+            ],
+        })
+    };
+    let (ux, uy) = (1.0 / w as f32, 1.0 / h as f32);
+    let u_down1 = uni([ux, uy, 0.85, 0.0]);
+    let u_bh1 = uni([1.0 / w1 as f32, 0.0, 0.0, 0.0]);
+    let u_bv1 = uni([0.0, 1.0 / h1 as f32, 0.0, 0.0]);
+    let u_down2 = uni([1.0 / w1 as f32, 1.0 / h1 as f32, 0.0, 0.0]);
+    let u_bh2 = uni([1.0 / w2 as f32, 0.0, 0.0, 0.0]);
+    let u_bv2 = uni([0.0, 1.0 / h2 as f32, 0.0, 0.0]);
+    let u_comp = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&[0.0f32; 4]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let passes = vec![
+        bg(&scene, &u_down1, &scene, &scene),
+        bg(&l1a, &u_bh1, &scene, &scene),
+        bg(&l1b, &u_bv1, &scene, &scene),
+        bg(&l1a, &u_down2, &scene, &scene),
+        bg(&l2a, &u_bh2, &scene, &scene),
+        bg(&l2b, &u_bv2, &scene, &scene),
+        bg(&scene, &u_comp, &l1a, &l2a),
+    ];
+    Targets { scene, depth, passes, views: [l1a, l1b, l2a, l2b], u_comp }
+}
+
+impl Gfx {
+    fn new(window: Arc<Window>, atlas: &scene::Atlas, capture: bool) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance.create_surface(window.clone()).expect("surface");
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        }))
+        .expect("no GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
+
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(&adapter);
+        // Gamma-space blending gives the punchy, filmic additive glow we want.
+        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        // recording reads frames back as 8-bit BGRA/RGBA for ffmpeg
+        let format = if capture {
+            caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm)).unwrap_or(format)
+        } else {
+            format
+        };
+        let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).expect("config");
+        config.format = format;
+        config.present_mode = wgpu::PresentMode::Fifo;
+        config.desired_maximum_frame_latency = 1;
+        if capture && caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        surface.configure(&device, &config);
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+        let tex = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("glyphs"),
+                size: wgpu::Extent3d { width: atlas.w, height: atlas.h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &atlas.data,
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // the desktop wallpaper the opening starts from (1×1 black when there is none)
+        let wp = crate::brand::get().wallpaper.as_ref();
+        let (ww, wh, wdata) = wp.map(|w| (w.w, w.h, w.rgba.as_slice())).unwrap_or((1, 1, &[0, 0, 0, 255]));
+        let wtex = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("wallpaper"),
+                size: wgpu::Extent3d { width: ww, height: wh, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm, // display values, like the swapchain: no sRGB decode
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            wdata,
+        );
+        let wview = wtex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&wview) },
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+
+        let attrs = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2, 3 => Float32];
+        let vlayout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &attrs,
+        };
+        let additive = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent::OVER,
+        };
+        let make = |label: &str, vs: &str, fs: &str, buffers: &[Option<wgpu::VertexBufferLayout>], blend: Option<wgpu::BlendState>, write: bool, always: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some(vs), compilation_options: Default::default(), buffers },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: HDR, blend, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH,
+                    depth_write_enabled: Some(write),
+                    depth_compare: Some(if always { wgpu::CompareFunction::Always } else { wgpu::CompareFunction::LessEqual }),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let floor = make("floor", "vs_full", "fs_floor", &[], None, false, true);
+        let add = make("add", "vs_main", "fs_main", &[Some(vlayout.clone())], Some(additive), false, false);
+        let alpha = make("alpha", "vs_main", "fs_main", &[Some(vlayout)], Some(wgpu::BlendState::ALPHA_BLENDING), true, false);
+
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("verts"),
+            size: (MAX_QUADS * 4 * 5 * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let indices: Vec<u32> = (0..MAX_QUADS as u32).flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i)).collect();
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("quad-indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        // ── post chain ──
+        let pp_shader = device.create_shader_module(wgpu::include_wgsl!("pp.wgsl"));
+        let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let pp_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                tex_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                tex_entry(3),
+                tex_entry(4),
+            ],
+        });
+        let pp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&pp_bgl)],
+            immediate_size: 0,
+        });
+        let pp_make = |fs: &str, fmt: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fs),
+                layout: Some(&pp_layout),
+                vertex: wgpu::VertexState { module: &pp_shader, entry_point: Some("vs_full"), compilation_options: Default::default(), buffers: &[] },
+                fragment: Some(wgpu::FragmentState {
+                    module: &pp_shader,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let t = build_targets(&device, &pp_bgl, &pp_sampler, config.width, config.height);
+        let post = Post {
+            down: pp_make("fs_down", HDR),
+            blur: pp_make("fs_blur", HDR),
+            comp: pp_make("fs_comp", format),
+            bgl: pp_bgl,
+            sampler: pp_sampler,
+            t,
+        };
+
+        Gfx { window, surface, device, queue, config, floor, add, alpha, vbuf, ibuf, ubuf, bind, post }
+    }
+
+    fn resize(&mut self, w: u32, h: u32) {
+        if w > 0 && h > 0 {
+            self.config.width = w;
+            self.config.height = h;
+            self.surface.configure(&self.device, &self.config);
+            self.post.t = build_targets(&self.device, &self.post.bgl, &self.post.sampler, w, h);
+        }
+    }
+
+    /// Renders a frame; with `capture`, also reads it back as tightly packed 4-byte pixels in the surface's format.
+    fn draw(&mut self, frame: &scene::Frame, uni: &Uniforms, capture: bool) -> Option<Vec<u8>> {
+        let st = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return None;
+            }
+            _ => return None,
+        };
+        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Upload all batches back-to-back into the one vertex buffer.
+        let batches: [&Vec<Vertex>; 5] = [&frame.m, &frame.p, &frame.b, &frame.a, &frame.c];
+        let vsz = std::mem::size_of::<Vertex>() as u64;
+        let mut ranges = [(0u32, 0u32); 5];
+        let mut off = 0u64;
+        for (i, b) in batches.iter().enumerate() {
+            let n = b.len().min(MAX_QUADS * 4);
+            ranges[i] = ((off / vsz) as u32, (n / 4) as u32);
+            if n > 0 {
+                self.queue.write_buffer(&self.vbuf, off, bytemuck::cast_slice(&b[..n]));
+            }
+            off += n as u64 * vsz;
+        }
+        self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(uni));
+
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.post.t.scene,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.post.t.depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_bind_group(0, &self.bind, &[]);
+            rp.set_pipeline(&self.floor);
+            rp.draw(0..3, 0..1);
+
+            rp.set_vertex_buffer(0, self.vbuf.slice(..));
+            rp.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            // mirrors → solids (write depth) → behind-glows → front-glows/HUD → vignette
+            let order = [(0usize, false), (2, true), (1, false), (3, false), (4, true)];
+            for (i, is_alpha) in order {
+                let (base, quads) = ranges[i];
+                if quads == 0 {
+                    continue;
+                }
+                rp.set_pipeline(if is_alpha { &self.alpha } else { &self.add });
+                rp.draw_indexed(0..quads * 6, base as i32, 0..1);
+            }
+        }
+        // bloom chain: bright-down → blur (¼ res) → down → blur (1/16 res) → composite
+        {
+            let t = &self.post.t;
+            self.queue.write_buffer(&t.u_comp, 0, bytemuck::cast_slice(&[0.0f32, 0.0, 0.0, uni.wall[0]]));
+            let fs_pass = |enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup| {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(pipe);
+                rp.set_bind_group(0, bg, &[]);
+                rp.draw(0..3, 0..1);
+            };
+            let [l1a, l1b, l2a, l2b] = &t.views;
+            fs_pass(&mut enc, l1a, &self.post.down, &t.passes[0]);
+            fs_pass(&mut enc, l1b, &self.post.blur, &t.passes[1]);
+            fs_pass(&mut enc, l1a, &self.post.blur, &t.passes[2]);
+            fs_pass(&mut enc, l2a, &self.post.down, &t.passes[3]);
+            fs_pass(&mut enc, l2b, &self.post.blur, &t.passes[4]);
+            fs_pass(&mut enc, l2a, &self.post.blur, &t.passes[5]);
+            fs_pass(&mut enc, &view, &self.post.comp, &t.passes[6]);
+        }
+        let grab = (capture && self.config.usage.contains(wgpu::TextureUsages::COPY_SRC)).then(|| {
+            let (w, h) = (self.config.width, self.config.height);
+            let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("grab"),
+                size: (row * h) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            enc.copy_texture_to_buffer(
+                st.texture.as_image_copy(),
+                wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            (buf, row, w, h)
+        });
+        self.queue.submit(Some(enc.finish()));
+        let out = grab.map(|(buf, row, w, h)| {
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let data = buf.slice(..).get_mapped_range().expect("map grab");
+            let mut px = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h as usize {
+                px.extend_from_slice(&data[y * row as usize..y * row as usize + w as usize * 4]);
+            }
+            px
+        });
+        self.window.pre_present_notify();
+        self.queue.present(st);
+        out
+    }
+}
+
+struct App {
+    gfx: Option<Gfx>,
+    scene: Scene,
+    sim: sim::Sim,
+    windowed: bool,
+    /// test/preview only: ignore input so a capture isn't interrupted
+    keep: bool,
+    start: Instant,
+    last: Instant,
+    next_frame: Instant,
+    frame_dt: Duration,
+    fps_acc: (u32, Instant),
+    fps: f32,
+    pointer0: Option<(f64, f64)>,
+    grace_until: Instant,
+    /// --dump: render on a fixed 60 fps clock and pipe every frame into ffmpeg
+    dump: Option<Dump>,
+}
+
+struct Dump {
+    path: String,
+    secs: f32,
+    frame: u32,
+    /// output size in pixels; frames are only recorded while the surface has exactly this size
+    size: (u32, u32),
+    written: u32,
+    ffmpeg: Option<std::process::Child>,
+}
+
+impl App {
+    fn quit(&self, el: &ActiveEventLoop) {
+        // Input lands on one monitor's instance only; take the rest down with us.
+        // every instance (one per monitor) goes down together, whatever the binary is called
+        let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "gridfall".into());
+        let _ = std::process::Command::new("pkill").args(["-x", &me]).spawn();
+        el.exit();
+    }
+
+    fn render(&mut self, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        let mut dt = (now - self.last).as_secs_f32();
+        self.last = now;
+        let mut t = (now - self.start).as_secs_f32();
+        if let Some(d) = &self.dump {
+            dt = 1.0 / 60.0;
+            t = d.frame as f32 / 60.0;
+        }
+        self.sim.aspect = self.gfx.as_ref().map(|g| g.config.width as f32 / g.config.height as f32).unwrap_or(1.6);
+        self.sim.update(dt);
+
+        self.fps_acc.0 += 1;
+        if now - self.fps_acc.1 >= Duration::from_millis(500) {
+            self.fps = self.fps_acc.0 as f32 / (now - self.fps_acc.1).as_secs_f32();
+            self.fps_acc = (0, now);
+        }
+
+        let Some(g) = self.gfx.as_mut() else { return };
+        let (w, h) = (g.config.width as f32, g.config.height as f32);
+        let fade = (t / 1.6).clamp(0.0, 1.0);
+        let (cam, pu, pc) = self.scene.build(&self.sim, t, w, h, if self.dump.is_some() { 60.0 } else { self.fps }, fade * fade * (3.0 - 2.0 * fade));
+        let uni = Uniforms {
+            inv_vp: cam.vp.inverse().to_cols_array_2d(),
+            eye: cam.eye.extend(1.0).to_array(),
+            params: [t, w / h, self.sim.scan_x, 0.0],
+            pulse: pu.map(|v| v.to_array()),
+            pcol: pc.map(|v| v.to_array()),
+            extra: {
+                let prog = self.sim.emerge_prog();
+                let ghost = if self.sim.scenario == sim::Scenario::Emerge { 1.0 - ((prog - 0.42) / 0.5).clamp(0.0, 1.0) } else { 0.0 };
+                let drift = if self.sim.scenario == sim::Scenario::Emerge { self.sim.scen_t * sim::EMERGE_CELL / 28.0 } else { 0.0 };
+                let bare = if self.sim.scenario == sim::Scenario::Run { 1.0 } else { 0.0 }; // transit: no floor seams, just the trails
+                [ghost, self.sim.tron, drift, bare]
+            },
+            wall_vp: {
+                let (e0, t0, u0) = self.sim.emerge_start_cam();
+                scene::camera(e0, t0, u0, w / h).0.vp.to_cols_array_2d()
+            },
+            wall: {
+                let br = crate::brand::get();
+                let em = self.sim.scenario == sim::Scenario::Emerge;
+                let prog = self.sim.emerge_prog();
+                // the real desktop holds until the world starts rising, then dissolves into the floor
+                let a = if em && br.wallpaper.is_some() { 1.0 - ((prog - 0.42) / 0.5).clamp(0.0, 1.0) } else { 0.0 };
+                let aspect = br.wallpaper.as_ref().map(|w| w.w as f32 / w.h as f32).unwrap_or(1.0);
+                [a, aspect, if br.desktop_grid { 1.0 } else { 0.0 }, 0.0]
+            },
+        };
+        let fmt = g.config.format;
+        let (gw, gh) = (g.config.width, g.config.height);
+        let px = g.draw(&self.scene.frame, &uni, self.dump.is_some());
+        if let Some(d) = self.dump.as_mut() {
+            d.frame += 1;
+            // let the window settle at its final size for a moment before the first recorded frame
+            if let Some(px) = px.filter(|_| d.frame > 30) {
+                if d.size == (gw, gh) {
+                    d.written += 1;
+                    let child = d.ffmpeg.get_or_insert_with(|| {
+                        let pix = if matches!(fmt, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb) { "bgra" } else { "rgba" };
+                        std::process::Command::new("ffmpeg")
+                            .args(["-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix, "-s", &format!("{gw}x{gh}"), "-r", "60", "-i", "-"])
+                            .args(["-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", "yuv420p", "-profile:v", "high", "-movflags", "+faststart", &d.path])
+                            .stdin(std::process::Stdio::piped())
+                            .spawn()
+                            .expect("ffmpeg")
+                    });
+                    use std::io::Write;
+                    let _ = child.stdin.as_mut().map(|s| s.write_all(&px));
+                }
+            }
+            if d.written as f32 >= d.secs * 60.0 {
+                if let Some(mut c) = d.ffmpeg.take() {
+                    drop(c.stdin.take());
+                    let _ = c.wait();
+                }
+                el.exit();
+            }
+        }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+        // a recording instance gets its own title so a compositor rule can route it off-screen without touching the screensaver
+        let title = if self.dump.is_some() { "gridfall-rec" } else { APP_ID };
+        let mut attrs = Window::default_attributes().with_title(title).with_decorations(false);
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs = attrs.with_name(APP_ID, APP_ID);
+        }
+        if let Some(d) = &self.dump {
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(d.size.0, d.size.1));
+        } else if !self.windowed {
+            attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
+        } else {
+            attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
+        }
+        let window = Arc::new(el.create_window(attrs).expect("window"));
+        if !self.windowed {
+            window.set_cursor_visible(false);
+        }
+        self.gfx = Some(Gfx::new(window, &self.scene.atlas, self.dump.is_some()));
+        if let (Some(g), Some(d)) = (self.gfx.as_mut(), &self.dump) {
+            g.resize(d.size.0, d.size.1);
+        }
+        let now = Instant::now();
+        self.start = now;
+        self.last = now;
+        self.grace_until = now + Duration::from_millis(600);
+        self.fps_acc = (0, now);
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+        let live = !self.windowed && !self.keep && Instant::now() > self.grace_until;
+        match ev {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Resized(s) => {
+                // a recording keeps its own frame size whatever the compositor gives the window
+                let (w, h) = self.dump.as_ref().map(|d| d.size).unwrap_or((s.width, s.height));
+                if let Some(g) = self.gfx.as_mut() {
+                    g.resize(w, h);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.windowed {
+                    if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)) {
+                        el.exit();
+                    }
+                } else if live {
+                    self.quit(el);
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, .. } | WindowEvent::Touch(_) if live => self.quit(el),
+            WindowEvent::CursorMoved { position, .. } if live => match self.pointer0 {
+                None => self.pointer0 = Some((position.x, position.y)),
+                Some((x, y)) => {
+                    if (position.x - x).abs() > 18.0 || (position.y - y).abs() > 18.0 {
+                        self.quit(el);
+                    }
+                }
+            },
+            WindowEvent::RedrawRequested => self.render(el),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_frame {
+            self.next_frame = (self.next_frame + self.frame_dt).max(now);
+            if let Some(g) = &self.gfx {
+                g.window.request_redraw();
+            }
+        }
+        el.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let windowed = args.iter().any(|a| a == "--windowed");
+    let fps: f64 = args
+        .iter()
+        .position(|a| a == "--fps")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60.0);
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
+
+    let el = EventLoop::new().expect("event loop");
+    let now = Instant::now();
+    let mut app = App {
+        gfx: None,
+        scene: Scene::new(),
+        sim: sim::Sim::new(seed),
+        windowed,
+        keep: args.iter().any(|a| a == "--keep"),
+        start: now,
+        last: now,
+        next_frame: now,
+        frame_dt: Duration::from_secs_f64(1.0 / fps.clamp(10.0, 240.0)),
+        fps_acc: (0, now),
+        fps: fps as f32,
+        pointer0: None,
+        grace_until: now,
+        dump: args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(|p| Dump {
+            path: p.clone(),
+            secs: args.iter().position(|a| a == "--secs").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(60.0),
+            frame: 0,
+            size: args.iter().position(|a| a == "--size").and_then(|i| args.get(i + 1)).and_then(|v| v.split_once('x')).and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).unwrap_or((1920, 1080)),
+            written: 0,
+            ffmpeg: None,
+        }),
+    };
+    // --record: hold the light-cycle arena and cycle its camera angles, with a larger HUD for a downscaled video
+    if args.iter().any(|a| a == "--record") {
+        app.sim.hold_arena = true;
+        app.scene.hud_scale = 1.4;
+        app.sim.jump(sim::Scenario::Arena);
+    }
+    if let Some(s) = args.iter().position(|a| a == "--hud").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<f32>().ok()) {
+        app.scene.hud_scale = s;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--scenario") {
+        match args.get(i + 1).map(|s| s.as_str()) {
+            Some("run") | Some("transit") => app.sim.jump(sim::Scenario::Run),
+            Some("twin") => app.sim.jump(sim::Scenario::Twin),
+            Some("arena") => app.sim.jump(sim::Scenario::Arena),
+            Some("emerge") => {}
+            _ => {}
+        }
+    }
+    el.run_app(&mut app).expect("run");
+}

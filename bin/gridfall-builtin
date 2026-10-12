@@ -1,0 +1,22 @@
+#!/bin/bash
+# off:     switch Omarchy's stock screensaver off (remembering that this plugin did it)
+# restore: switch it back on, but only if this plugin was what switched it off
+set -u
+marker="${XDG_STATE_HOME:-$HOME/.local/state}/gridfall/disabled-builtin-screensaver"
+case "${1:-}" in
+  off)
+    if ! omarchy-toggle-enabled screensaver-off 2>/dev/null; then
+      omarchy-toggle screensaver-off on && mkdir -p "$(dirname "$marker")" && touch "$marker"
+    fi
+    ;;
+  restore)
+    if [[ -f "$marker" ]]; then
+      omarchy-toggle screensaver-off off
+      rm -f "$marker"
+    fi
+    ;;
+  *)
+    echo "usage: gridfall-builtin off|restore" >&2
+    exit 1
+    ;;
+esac

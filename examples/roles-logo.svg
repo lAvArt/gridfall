@@ -1,0 +1,9 @@
+<!-- How shapes map to the screensaver's materials: by id prefix (on the shape or a parent group).
+     no prefix = armour plate with lit edges · base… = dim base plate · echo… = recessed echo layer · glow… = light channel
+     This is the Twinise mark, as used by the "lavart" preset. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2048 2048">
+  <polygon id="base-bar" points="0,483.65 1564.35,483.65 2048,0 483.64,0" fill="#bebebe"/>
+  <polygon id="stem" points="1549.67,597.76 1550.06,1394.23 896.32,2048 896.32,1251.11" fill="#e68e0d"/>
+  <polygon id="echo-stem" points="1450.24,597.76 1450.63,1379.48 782.14,2048 782.14,1265.86" fill="#e68e0d" opacity="0.6"/>
+  <polygon id="glow-sliver" points="2048,30.90 2048,68.57 896.16,1220.43 896.16,1182.74" fill="#ffc780"/>
+</svg>

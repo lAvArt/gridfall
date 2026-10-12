@@ -1,0 +1,15 @@
+{
+  "logo": "omarchy",
+  "wallpaper": "auto",
+  "name": "omarchy",
+  "wordmark": [],
+  "tagline": "",
+  "footer": "",
+  "repo": "omacom/omarchy",
+  "accent": "auto",
+  "teams": ["#ff2919", "#0d80ff"],
+  "drafting": true,
+  "desktop_grid": false,
+  "logo_on_wallpaper": false,
+  "mark_offset": 0.0
+}
