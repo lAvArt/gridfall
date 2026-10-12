@@ -167,15 +167,22 @@ fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &w
 
 impl Gfx {
     fn new(window: Arc<Window>, atlas: &scene::Atlas, capture: bool) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance.create_surface(window.clone()).expect("surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: if want_fast_gpu() { wgpu::PowerPreference::HighPerformance } else { wgpu::PowerPreference::LowPower },
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("no GPU adapter");
+        // Vulkan only: probing OpenGL too would wake every GPU in the machine just to list it
+        let open = |backends: wgpu::Backends| {
+            let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
+            d.backends = backends;
+            let instance = wgpu::Instance::new(d);
+            let surface = instance.create_surface(window.clone()).expect("surface");
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: if want_fast_gpu() { wgpu::PowerPreference::HighPerformance } else { wgpu::PowerPreference::LowPower },
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            }))
+            .ok();
+            adapter.map(|a| (instance, surface, a))
+        };
+        let (_instance, surface, adapter) = open(wgpu::Backends::VULKAN).or_else(|| open(wgpu::Backends::all())).expect("no GPU adapter");
         if debug() {
             let i = adapter.get_info();
             eprintln!("gridfall: adapter {} ({:?}, {:?})", i.name, i.device_type, i.backend);
@@ -592,15 +599,20 @@ impl Gfx {
     }
 }
 
-/// Which GPU to render on (`gpu` in the config, or GRIDFALL_GPU): "low" the integrated one, "high" the discrete one,
-/// "auto" (default) the discrete one while on mains power and the integrated one on battery.
+/// Which GPU to render on (`gpu` in the config, or GRIDFALL_GPU): the integrated, power-saving one unless "high".
+/// A screensaver shouldn't wake a laptop's discrete GPU: bringing it out of deep sleep and keeping it busy is what
+/// knocks some hybrid laptops' NVIDIA cards off the bus.
 fn want_fast_gpu() -> bool {
-    let pref = std::env::var("GRIDFALL_GPU").unwrap_or_else(|_| crate::brand::get().gpu.clone());
-    match pref.as_str() {
-        "low" => false,
-        "high" => true,
-        _ => on_mains(),
-    }
+    std::env::var("GRIDFALL_GPU").unwrap_or_else(|_| crate::brand::get().gpu.clone()) == "high"
+}
+
+/// A GPU other than an NVIDIA one is present (the integrated GPU of a hybrid laptop, or an AMD/Intel card).
+fn has_other_gpu() -> bool {
+    std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten().any(|e| {
+        let vendor = std::fs::read_to_string(e.path().join("device/vendor")).unwrap_or_default();
+        let v = vendor.trim();
+        !v.is_empty() && v != "0x10de"
+    })
 }
 
 /// Plugged in (or a machine without a battery).
@@ -911,6 +923,12 @@ impl ApplicationHandler for App {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Keep a hybrid laptop's NVIDIA card asleep: the Vulkan loader then never even loads its driver (merely listing
+    // the GPUs would wake it). Set before any thread starts.
+    if !want_fast_gpu() && has_other_gpu() && std::env::var_os("VK_LOADER_DRIVERS_DISABLE").is_none() {
+        // SAFETY: single-threaded at this point; nothing else reads the environment concurrently
+        unsafe { std::env::set_var("VK_LOADER_DRIVERS_DISABLE", "*nvidia*") };
+    }
     let windowed = args.iter().any(|a| a == "--windowed");
     // --fps caps the frame rate; without it Gridfall renders at the display's refresh rate
     let fps: Option<f64> = args.iter().position(|a| a == "--fps").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok());

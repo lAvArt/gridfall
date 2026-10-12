@@ -382,7 +382,7 @@ pub struct Brand {
     pub logo_on_wallpaper: bool,
     /// where the flat logo sits across the opening frame (fraction of its height; 0 = centred)
     pub mark_offset: f32,
-    /// "auto" (discrete GPU on mains power, integrated on battery), "low" or "high"
+    /// "auto"/"low": the integrated, power-saving GPU (the discrete one stays asleep); "high": the fast one
     pub gpu: String,
 }
 

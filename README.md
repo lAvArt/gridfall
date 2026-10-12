@@ -116,7 +116,7 @@ Here's everything you can set:
 | `teams` | The two light-cycle colours | red and blue |
 | `drafting` | Construction lines and measurements around the logo at the start | `true` |
 | `logo_on_wallpaper` | Set to `true` if your wallpaper already has the logo on it, so it's there from the first frame | `false` |
-| `gpu` | `"auto"` uses your fast GPU while you're plugged in and the power-saving one on battery. You can also force `"high"` or `"low"` | `"auto"` |
+| `gpu` | `"auto"` renders on your power-saving GPU and leaves a laptop's discrete GPU asleep. `"high"` uses the fast one | `"auto"` |
 
 On battery Gridfall also drops to half your display's refresh rate, so leaving your laptop idle doesn't drain it.
 
