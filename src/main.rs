@@ -50,6 +50,21 @@ struct Gfx {
     ubuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     post: Post,
+    /// recording: frames go to this texture instead of the window, so a covered or hidden window can't stall them
+    offscreen: Option<wgpu::Texture>,
+}
+
+fn offscreen_target(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("recording"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
 }
 
 /// Size-dependent post-processing resources (HDR scene + two-level bloom chain).
@@ -155,29 +170,35 @@ impl Gfx {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone()).expect("surface");
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
+            power_preference: if want_fast_gpu() { wgpu::PowerPreference::HighPerformance } else { wgpu::PowerPreference::LowPower },
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
             apply_limit_buckets: false,
         }))
         .expect("no GPU adapter");
+        if debug() {
+            let i = adapter.get_info();
+            eprintln!("gridfall: adapter {} ({:?}, {:?})", i.name, i.device_type, i.backend);
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
-        if std::env::var_os("GRIDFALL_DEBUG").is_some() {
+        if debug() {
             eprintln!("gridfall: surface formats {:?}", caps.formats);
         }
         // Gamma-space blending gives the punchy, filmic additive glow we want.
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
-        // The live window gets a float surface, which the compositor reads as linear light and gamma-encodes for the
-        // panel. A recording reads frames back as 8-bit BGRA/RGBA for ffmpeg: an sRGB surface applies that same
-        // encoding, so the video shows exactly what the screen does.
-        let format = if capture {
-            caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Rgba8UnormSrgb)).unwrap_or(format)
+        // 8-bit sRGB: the output is linear light, encoded for the panel by the GPU. Matches the wallpaper exactly (a
+        // float surface leaves the encoding to the compositor, which crushes the near-blacks), costs half the
+        // bandwidth, and is exactly what a recording reads back.
+        let srgb = caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Rgba8UnormSrgb));
+        let format = if std::env::var("GRIDFALL_SURFACE").as_deref() == Ok("float") {
+            caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0])
         } else {
-            format
+            srgb.unwrap_or(caps.formats[0])
         };
+        // a recording reads the frames back as 8-bit BGRA/RGBA for ffmpeg
+        let format = if capture { srgb.unwrap_or(format) } else { format };
         let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).expect("config");
         config.format = format;
         config.present_mode = wgpu::PresentMode::Fifo;
@@ -186,6 +207,9 @@ impl Gfx {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
         }
         surface.configure(&device, &config);
+        if debug() {
+            eprintln!("gridfall: surface {:?} {}x{}", config.format, config.width, config.height);
+        }
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
@@ -413,29 +437,43 @@ impl Gfx {
             t,
         };
 
-        Gfx { window, surface, device, queue, config, floor, add, alpha, vbuf, ibuf, ubuf, bind, post }
+        let offscreen = capture.then(|| offscreen_target(&device, config.format, config.width, config.height));
+        Gfx { window, surface, device, queue, config, floor, add, alpha, vbuf, ibuf, ubuf, bind, post, offscreen }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
         if w > 0 && h > 0 {
             self.config.width = w;
             self.config.height = h;
-            self.surface.configure(&self.device, &self.config);
+            if self.offscreen.is_some() {
+                self.offscreen = Some(offscreen_target(&self.device, self.config.format, w, h));
+            } else {
+                self.surface.configure(&self.device, &self.config);
+            }
             self.post.t = build_targets(&self.device, &self.post.bgl, &self.post.sampler, w, h);
         }
     }
 
     /// Renders a frame; with `capture`, also reads it back as tightly packed 4-byte pixels in the surface's format.
     fn draw(&mut self, frame: &scene::Frame, uni: &Uniforms, capture: bool) -> Option<Vec<u8>> {
-        let st = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                return None;
+        let st = if self.offscreen.is_some() {
+            None
+        } else {
+            match self.surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    self.surface.configure(&self.device, &self.config);
+                    return None;
+                }
+                _ => return None,
             }
+        };
+        let target = match (&self.offscreen, &st) {
+            (Some(t), _) => t.clone(),
+            (None, Some(s)) => s.texture.clone(),
             _ => return None,
         };
-        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Upload all batches back-to-back into the one vertex buffer.
         let batches: [&Vec<Vertex>; 5] = [&frame.m, &frame.p, &frame.b, &frame.a, &frame.c];
@@ -519,7 +557,7 @@ impl Gfx {
             fs_pass(&mut enc, l2a, &self.post.blur, &t.passes[5]);
             fs_pass(&mut enc, &view, &self.post.comp, &t.passes[6]);
         }
-        let grab = (capture && self.config.usage.contains(wgpu::TextureUsages::COPY_SRC)).then(|| {
+        let grab = (capture && (self.offscreen.is_some() || self.config.usage.contains(wgpu::TextureUsages::COPY_SRC))).then(|| {
             let (w, h) = (self.config.width, self.config.height);
             let row = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -529,7 +567,7 @@ impl Gfx {
                 mapped_at_creation: false,
             });
             enc.copy_texture_to_buffer(
-                st.texture.as_image_copy(),
+                target.as_image_copy(),
                 wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
@@ -546,13 +584,56 @@ impl Gfx {
             }
             px
         });
-        self.window.pre_present_notify();
-        self.queue.present(st);
+        if let Some(st) = st {
+            self.window.pre_present_notify();
+            self.queue.present(st);
+        }
         out
     }
 }
 
+/// Which GPU to render on (`gpu` in the config, or GRIDFALL_GPU): "low" the integrated one, "high" the discrete one,
+/// "auto" (default) the discrete one while on mains power and the integrated one on battery.
+fn want_fast_gpu() -> bool {
+    let pref = std::env::var("GRIDFALL_GPU").unwrap_or_else(|_| crate::brand::get().gpu.clone());
+    match pref.as_str() {
+        "low" => false,
+        "high" => true,
+        _ => on_mains(),
+    }
+}
+
+/// Plugged in (or a machine without a battery).
+fn on_mains() -> bool {
+    let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") else { return true };
+    let mut battery = false;
+    for e in dir.flatten() {
+        let p = e.path();
+        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+        match kind.trim() {
+            "Mains" if std::fs::read_to_string(p.join("online")).unwrap_or_default().trim() == "1" => return true,
+            "Battery" => battery = true,
+            _ => {}
+        }
+    }
+    !battery
+}
+
+fn debug() -> bool {
+    std::env::var_os("GRIDFALL_DEBUG").is_some()
+}
+
+/// GRIDFALL_DEBUG timing: frames and CPU milliseconds spent in update / scene build / draw since `since`
+struct Prof {
+    n: u32,
+    upd: f32,
+    build: f32,
+    draw: f32,
+    since: Instant,
+}
+
 struct App {
+    prof: Prof,
     gfx: Option<Gfx>,
     scene: Scene,
     sim: sim::Sim,
@@ -562,7 +643,12 @@ struct App {
     start: Instant,
     last: Instant,
     next_frame: Instant,
+    /// minimum time between frames; zero = every display refresh (vsync)
     frame_dt: Duration,
+    /// no --fps given: follow the display, halving to a steady rate if the GPU can't keep up
+    adaptive: bool,
+    refresh: f32,
+    slow: u32,
     fps_acc: (u32, Instant),
     fps: f32,
     pointer0: Option<(f64, f64)>,
@@ -583,10 +669,22 @@ struct Dump {
 
 impl App {
     fn quit(&self, el: &ActiveEventLoop) {
-        // Input lands on one monitor's instance only; take the rest down with us.
-        // every instance (one per monitor) goes down together, whatever the binary is called
-        let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "gridfall".into());
-        let _ = std::process::Command::new("pkill").args(["-x", &me]).spawn();
+        // Input lands on one monitor's instance only; take the other screensaver instances down with us (same binary,
+        // whatever it is called), but leave recordings and windowed previews running.
+        let me = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default();
+        let own = std::process::id();
+        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+            if pid == own || std::fs::read_to_string(e.path().join("comm")).unwrap_or_default().trim() != me.get(..15).unwrap_or(&me) {
+                continue;
+            }
+            let cmd = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+            let args: Vec<&[u8]> = cmd.split(|&b| b == 0).collect();
+            if args.iter().any(|a| *a == b"--dump" || *a == b"--windowed") {
+                continue;
+            }
+            let _ = std::process::Command::new("kill").arg(pid.to_string()).spawn();
+        }
         el.exit();
     }
 
@@ -600,17 +698,30 @@ impl App {
             t = d.frame as f32 / 60.0;
         }
         self.sim.aspect = self.gfx.as_ref().map(|g| g.config.width as f32 / g.config.height as f32).unwrap_or(1.6);
+        let t0 = Instant::now();
         self.sim.update(dt);
+        self.prof.upd += t0.elapsed().as_secs_f32() * 1000.0;
 
         self.fps_acc.0 += 1;
         if now - self.fps_acc.1 >= Duration::from_millis(500) {
             self.fps = self.fps_acc.0 as f32 / (now - self.fps_acc.1).as_secs_f32();
             self.fps_acc = (0, now);
+            // falling short of a fast display judders between full and half rate: settle on a steady half rate
+            if self.adaptive && self.dump.is_none() && self.frame_dt.is_zero() && self.refresh >= 90.0 {
+                self.slow = if self.fps < self.refresh * 0.9 { self.slow + 1 } else { 0 };
+                if self.slow >= 4 {
+                    self.frame_dt = Duration::from_secs_f32(1.0 / (self.refresh * 0.5));
+                    if debug() {
+                        eprintln!("gridfall: {:.0} fps on a {:.0} Hz display: pacing at {:.0}", self.fps, self.refresh, self.refresh * 0.5);
+                    }
+                }
+            }
         }
 
         let Some(g) = self.gfx.as_mut() else { return };
         let (w, h) = (g.config.width as f32, g.config.height as f32);
         let fade = (t / 1.6).clamp(0.0, 1.0);
+        let t1 = Instant::now();
         let (cam, pu, pc) = self.scene.build(&self.sim, t, w, h, if self.dump.is_some() { 60.0 } else { self.fps }, fade * fade * (3.0 - 2.0 * fade));
         let uni = Uniforms {
             inv_vp: cam.vp.inverse().to_cols_array_2d(),
@@ -641,7 +752,30 @@ impl App {
         };
         let fmt = g.config.format;
         let (gw, gh) = (g.config.width, g.config.height);
+        let t2 = Instant::now();
         let px = g.draw(&self.scene.frame, &uni, self.dump.is_some());
+        let t3 = Instant::now();
+        self.prof.build += (t2 - t1).as_secs_f32() * 1000.0;
+        self.prof.draw += (t3 - t2).as_secs_f32() * 1000.0;
+        self.prof.n += 1;
+        if debug() && t3 - self.prof.since >= Duration::from_secs(2) {
+            let n = self.prof.n as f32;
+            let f = &self.scene.frame;
+            let quads = (f.m.len() + f.p.len() + f.b.len() + f.a.len() + f.c.len()) / 4;
+            eprintln!(
+                "gridfall: {:5.1} fps  update {:.2} ms  build {:.2} ms  draw {:.2} ms  quads {}  shards {}  {:?} {}x{}",
+                n / (t3 - self.prof.since).as_secs_f32(),
+                self.prof.upd / n,
+                self.prof.build / n,
+                self.prof.draw / n,
+                quads,
+                self.sim.shards.len(),
+                self.sim.scenario,
+                gw,
+                gh
+            );
+            self.prof = Prof { n: 0, upd: 0.0, build: 0.0, draw: 0.0, since: t3 };
+        }
         if let Some(d) = self.dump.as_mut() {
             d.frame += 1;
             // let the window settle at its final size for a moment before the first recorded frame
@@ -695,6 +829,10 @@ impl ApplicationHandler for App {
             attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
         }
         let window = Arc::new(el.create_window(attrs).expect("window"));
+        self.refresh = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).map(|r| r as f32 / 1000.0).unwrap_or(60.0);
+        if self.adaptive && self.dump.is_none() && !on_mains() && self.refresh >= 90.0 {
+            self.frame_dt = Duration::from_secs_f32(1.0 / (self.refresh * 0.5));
+        }
         if !self.windowed {
             window.set_cursor_visible(false);
         }
@@ -738,12 +876,28 @@ impl ApplicationHandler for App {
                     }
                 }
             },
-            WindowEvent::RedrawRequested => self.render(el),
+            WindowEvent::RedrawRequested if self.dump.is_none() => self.render(el),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.dump.is_some() {
+            // recording: as fast as the GPU goes, independent of the window and the compositor
+            if self.gfx.is_some() {
+                self.render(el);
+            }
+            el.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+        if self.frame_dt.is_zero() {
+            // paced by the display: presenting blocks until the next refresh
+            if let Some(g) = &self.gfx {
+                g.window.request_redraw();
+            }
+            el.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         let now = Instant::now();
         if now >= self.next_frame {
             self.next_frame = (self.next_frame + self.frame_dt).max(now);
@@ -758,17 +912,14 @@ impl ApplicationHandler for App {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let windowed = args.iter().any(|a| a == "--windowed");
-    let fps: f64 = args
-        .iter()
-        .position(|a| a == "--fps")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60.0);
+    // --fps caps the frame rate; without it Gridfall renders at the display's refresh rate
+    let fps: Option<f64> = args.iter().position(|a| a == "--fps").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok());
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
 
     let el = EventLoop::new().expect("event loop");
     let now = Instant::now();
     let mut app = App {
+        prof: Prof { n: 0, upd: 0.0, build: 0.0, draw: 0.0, since: now },
         gfx: None,
         scene: Scene::new(),
         sim: sim::Sim::new(seed),
@@ -777,9 +928,13 @@ fn main() {
         start: now,
         last: now,
         next_frame: now,
-        frame_dt: Duration::from_secs_f64(1.0 / fps.clamp(10.0, 240.0)),
+        frame_dt: fps.map(|f| Duration::from_secs_f64(1.0 / f.clamp(10.0, 240.0))).unwrap_or(Duration::ZERO),
+        adaptive: fps.is_none(),
+        // on battery a screensaver shouldn't drain the laptop: start at half the display rate (see resumed)
+        refresh: 60.0,
+        slow: 0,
         fps_acc: (0, now),
-        fps: fps as f32,
+        fps: fps.unwrap_or(60.0) as f32,
         pointer0: None,
         grace_until: now,
         dump: args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(|p| Dump {

@@ -341,7 +341,7 @@ fn gen_nodes(rng: &mut Rng) -> Vec<Tower> {
 /// Shot length in recording mode.
 const SHOT_HOLD: f32 = 12.0;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Scenario {
     Emerge,
     Arena,

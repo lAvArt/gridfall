@@ -119,21 +119,30 @@ fn haze(dir: vec3<f32>) -> vec3<f32> {
     return mix(phys, teal, sm);
 }
 
-// seam lines: `wpx` is the line thickness in pixels
-fn gridline(q: vec2<f32>, cell: f32, wpx: f32) -> f32 {
+// seam lines: `wpx` is the line thickness in pixels; `fq` is fwidth of the floor position, worked out once per pixel
+// (so nothing after it needs derivatives and the shader can skip work it doesn't need)
+fn gridline(q: vec2<f32>, fq: vec2<f32>, cell: f32, wpx: f32) -> f32 {
     let c = q / cell;
-    let w = fwidth(c);
+    let w = fq / cell;
     let g = abs(fract(c - 0.5) - 0.5) / max(w, vec2<f32>(1e-5));
     let l = 1.0 - min(min(g.x, g.y) / wpx, 1.0);
     return l * (1.0 - smoothstep(0.05, 0.12, max(w.x, w.y)));
 }
 
-fn vnoise(p: vec2<f32>) -> f32 {
+// value noise and its gradient: (value, d/dx, d/dy)
+fn vnoise(p: vec2<f32>) -> vec3<f32> {
     let i = floor(p);
     let f = fract(p);
     let u2 = f * f * (3.0 - 2.0 * f);
-    return mix(mix(hash12(i), hash12(i + vec2<f32>(1.0, 0.0)), u2.x),
-               mix(hash12(i + vec2<f32>(0.0, 1.0)), hash12(i + vec2<f32>(1.0, 1.0)), u2.x), u2.y);
+    let du = 6.0 * f * (1.0 - f);
+    let a = hash12(i);
+    let b = hash12(i + vec2<f32>(1.0, 0.0));
+    let c = hash12(i + vec2<f32>(0.0, 1.0));
+    let d = hash12(i + vec2<f32>(1.0, 1.0));
+    let k = a - b - c + d;
+    let v = a + (b - a) * u2.x + (c - a) * u2.y + k * u2.x * u2.y;
+    let g = du * (vec2<f32>(b - a, c - a) + k * u2.yx);
+    return vec3<f32>(v, g);
 }
 
 @fragment
@@ -146,18 +155,22 @@ fn fs_floor(i: FOut) -> @location(0) vec4<f32> {
     let dy = min(dir.y, -1e-3);
     let t = -eye.y / dy;
     let q = eye.xz + dir.xz * t;
+    // the only derivative the floor needs; everything below works from it
+    let fq = fwidth(q);
+    let grain = (hash12(i.pos.xy + u.params.x) - 0.5) * 0.0007;
+    let hz = haze(dir);
+
+    // sky
+    if (dir.y >= 0.0) {
+        let sky = hz * (0.75 + 0.25 * exp(-dir.y * 7.0)) + vec3<f32>(0.0002, 0.0003, 0.0006);
+        return vec4<f32>(max(sky + grain, vec3<f32>(0.0)), 1.0);
+    }
 
     let scan = u.params.z;
     let dg = clamp((scan + 6.0 - q.x) / 12.0, 0.0, 1.0);
     let dig = dg * dg * (3.0 - 2.0 * dg);       // 1 = digitised (behind the scan front)
     // a few wide seams instead of a dense grid (cf. the Ares hall floor)
-    let seam = gridline(q, 30.0, 2.6) * dig * (1.0 - u.extra.w);
-    // physical world ahead of the scan: organic terrain contours
-    let hgt = vnoise(q * 0.045) * 0.65 + vnoise(q * 0.12) * 0.35;
-    let hb = hgt * 16.0;
-    let band = abs(fract(hb) - 0.5) / max(fwidth(hb), 1e-4);
-    let contour = (1.0 - min(band, 1.0)) * (1.0 - smoothstep(0.2, 0.5, fwidth(hb)));
-    let hz = haze(dir);
+    let seam = gridline(q, fq, 30.0, 2.6) * dig * (1.0 - u.extra.w);
 
     // floor
     let fog = exp(-t * 0.0085);
@@ -166,21 +179,34 @@ fn fs_floor(i: FOut) -> @location(0) vec4<f32> {
     // #121212 once tone-mapped; becomes teal-black gloss as the Tron palette comes in
     var col = mix(vec3<f32>(0.006, 0.007, 0.010), mix(vec3<f32>(0.0064), vec3<f32>(0.0085, 0.0105, 0.0185), tron), dig);
     col += mix(vec3<f32>(0.10), vec3<f32>(0.30, 0.50, 0.85), tron) * seam * 0.10 * smoothstep(0.0, 0.5, tron) * fog;
-    // the desktop background's drifting hairline grid (48px cells, every 4th emphasised)
-    let gq = vec2<f32>(q.x + u.extra.z, q.y - u.extra.z);
-    let hair = gridline(gq, 2.65, 1.0) * 0.0027 + gridline(gq, 10.6, 1.0) * 0.0058;
-    col += vec3<f32>(1.0) * hair * ghost * dig * u.wall.z;
+    // the desktop background's drifting hairline grid (48px cells, every 4th emphasised), only while it is up
+    if (ghost * u.wall.z > 0.0) {
+        let gq = vec2<f32>(q.x + u.extra.z, q.y - u.extra.z);
+        let hair = gridline(gq, fq, 2.65, 1.0) * 0.0027 + gridline(gq, fq, 10.6, 1.0) * 0.0058;
+        col += vec3<f32>(1.0) * hair * ghost * dig;
+    }
     for (var k = 0; k < 4; k = k + 1) {
         let p = u.pulse[k];
         if (p.w > 0.0) {
-            let d = length(q - p.xy);
+            let rel = q - p.xy;
+            let d = length(rel);
             // laser-thin ring: hard edge (one pixel of AA), no soft halo, kept faint
-            let aa = max(fwidth(d), 1e-3);
+            let aa = max(dot(fq, abs(rel) / max(d, 1e-4)), 1e-3);
             let ring = (1.0 - smoothstep(0.07, 0.07 + aa, abs(d - p.z))) * p.w;
             col += u.pcol[k].rgb * ring * (0.07 + 0.6 * seam) * exp(-p.z * 0.014);
         }
     }
-    col += vec3<f32>(0.40, 0.38, 0.34) * contour * (1.0 - dig) * 0.10 * fog;
+    // physical world ahead of the scan: organic terrain contours (only where it is still physical, and not lost in fog)
+    if (dig < 0.999 && fog > 0.003) {
+        let n1v = vnoise(q * 0.045);
+        let n2v = vnoise(q * 0.12);
+        let hb = (n1v.x * 0.65 + n2v.x * 0.35) * 16.0;
+        let ghb = (n1v.yz * 0.045 * 0.65 + n2v.yz * 0.12 * 0.35) * 16.0;
+        let fwb = dot(abs(ghb), fq);
+        let band = abs(fract(hb) - 0.5) / max(fwb, 1e-4);
+        let contour = (1.0 - min(band, 1.0)) * (1.0 - smoothstep(0.2, 0.5, fwb));
+        col += vec3<f32>(0.40, 0.38, 0.34) * contour * (1.0 - dig) * 0.10 * fog;
+    }
     // the scan front itself
     let sd = (q.x - scan);
     col += vec3<f32>(0.30, 0.78, 1.0) * (1.0 * exp(-sd * sd / 0.06) + 0.012 * exp(-sd * sd / 6.0)) * smoothstep(10.0, 45.0, t) * exp(-t * 0.004);
@@ -188,12 +214,9 @@ fn fs_floor(i: FOut) -> @location(0) vec4<f32> {
     col += hz * pow(1.0 - clamp(-dir.y, 0.0, 1.0), 6.0) * 0.30;
     col = mix(hz, col, mix(fog, 1.0, ghost));
 
-    // sky
-    let sky = hz * (0.75 + 0.25 * exp(-max(dir.y, 0.0) * 7.0)) + vec3<f32>(0.0002, 0.0003, 0.0006);
-
     // the user's wallpaper, pinned to the floor where it filled the opening frame (cover-fit, like the desktop),
     // written through the inverse tone curve so it reads exactly as on the desktop
-    if (u.wall.x > 0.0 && dir.y < 0.0) {
+    if (u.wall.x > 0.0) {
         let c = u.wall_vp * vec4<f32>(q.x, 0.0, q.y, 1.0);
         if (c.w > 0.0) {
             let ndc = c.xy / c.w;
@@ -212,7 +235,5 @@ fn fs_floor(i: FOut) -> @location(0) vec4<f32> {
             col = mix(col, hdr, u.wall.x * m);
         }
     }
-    var outc = select(sky, col, dir.y < 0.0);
-    outc += (hash12(i.pos.xy + u.params.x) - 0.5) * 0.0007;
-    return vec4<f32>(max(outc, vec3<f32>(0.0)), 1.0);
+    return vec4<f32>(max(col + grain, vec3<f32>(0.0)), 1.0);
 }

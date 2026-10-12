@@ -29,7 +29,8 @@ triangles, forks and pull requests into prisms, pushes into long slabs, and merg
 After the battle the camera flies down a corridor of light toward the logo, which turns into a slowly turning
 monolith with a cyan "digital twin" floating behind it, and then the whole thing loops back to the start.
 
-It's written in Rust on top of wgpu, so it runs on the GPU at a steady 60 fps.
+It's written in Rust on top of wgpu and runs at your display's refresh rate, so on a 120 Hz laptop panel it
+moves as smoothly as the rest of your desktop.
 
 🎬 [Watch the full two-minute loop](docs/media/gridfall-demo.mp4)
 
@@ -115,11 +116,14 @@ Here's everything you can set:
 | `teams` | The two light-cycle colours | red and blue |
 | `drafting` | Construction lines and measurements around the logo at the start | `true` |
 | `logo_on_wallpaper` | Set to `true` if your wallpaper already has the logo on it, so it's there from the first frame | `false` |
+| `gpu` | `"auto"` uses your fast GPU while you're plugged in and the power-saving one on battery. You can also force `"high"` or `"low"` | `"auto"` |
+
+On battery Gridfall also drops to half your display's refresh rate, so leaving your laptop idle doesn't drain it.
 
 ## Recording a video
 
 Gridfall can render straight to a video file, frame by frame at a fixed 60 fps, so you get a smooth result
-however busy your machine is (needs `ffmpeg`):
+however busy your machine is. It renders off-screen, so you can keep working while it records (needs `ffmpeg`):
 
 ```bash
 gridfall --dump loop.mp4 --secs 121 --size 1920x1080

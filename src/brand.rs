@@ -382,6 +382,8 @@ pub struct Brand {
     pub logo_on_wallpaper: bool,
     /// where the flat logo sits across the opening frame (fraction of its height; 0 = centred)
     pub mark_offset: f32,
+    /// "auto" (discrete GPU on mains power, integrated on battery), "low" or "high"
+    pub gpu: String,
 }
 
 static BRAND: OnceLock<Brand> = OnceLock::new();
@@ -507,6 +509,7 @@ fn load(args: &[String]) -> Brand {
         desktop_grid: b("desktop_grid", lavart),
         drafting: b("drafting", true),
         logo_on_wallpaper: b("logo_on_wallpaper", lavart),
+        gpu: s("gpu").unwrap_or_else(|| "auto".into()),
         mark_offset: cfg.get("mark_offset").and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(if lavart { 0.32 } else { 0.0 }),
     }
 }
