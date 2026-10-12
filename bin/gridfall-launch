@@ -15,7 +15,7 @@ for c in "$HOME/.cargo/bin/gridfall" "$HOME/.local/bin/gridfall" "$root/target/r
   fi
 done
 if [[ -z "$bin" ]]; then
-  notify-send -u normal "Gridfall" "Not built yet. Run: cargo install --locked --path $root" 2>/dev/null
+  notify-send -u normal "Gridfall" "Not built yet. Run: cargo install --locked --path $root --target-dir ~/.cache/gridfall/build" 2>/dev/null
   exit 1
 fi
 

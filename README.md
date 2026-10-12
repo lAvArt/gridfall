@@ -34,12 +34,14 @@ You'll need the Rust toolchain to build it once (`sudo pacman -S rust` if you do
 
 ```bash
 omarchy plugin add https://github.com/lAvArt/gridfall
-cargo install --locked --path ~/.config/omarchy/plugins/io.github.lavart.gridfall
+cargo install --locked --path ~/.config/omarchy/plugins/io.github.lavart.gridfall \
+  --target-dir ~/.cache/gridfall/build
 omarchy plugin enable io.github.lavart.gridfall
 ```
 
-The middle step compiles Gridfall and puts it in `~/.cargo/bin`. It builds in a temporary folder, so nothing
-lands inside the plugin folder that Omarchy watches.
+The `cargo install` step compiles Gridfall and puts it in `~/.cargo/bin`. The build happens in
+`~/.cache/gridfall/build`, outside the plugin folder (Omarchy watches that folder, and a build inside it would make
+the shell reload thousands of times).
 
 That's it. Gridfall now runs after the same idle timeout as Omarchy's built-in screensaver (you can change it in
 `~/.config/omarchy/shell.json` under `idle.screensaver`). Press any key or move the mouse and you're back. Omarchy's
@@ -127,7 +129,8 @@ gridfall --record --dump arena.mp4 --secs 48     # just the arena, from every ca
 
 ```bash
 omarchy plugin update io.github.lavart.gridfall
-cargo install --locked --path ~/.config/omarchy/plugins/io.github.lavart.gridfall
+cargo install --locked --path ~/.config/omarchy/plugins/io.github.lavart.gridfall \
+  --target-dir ~/.cache/gridfall/build
 ```
 
 ## Removing it
@@ -139,7 +142,7 @@ cargo uninstall gridfall
 
 Removing or disabling Gridfall turns Omarchy's stock screensaver back on, if Gridfall was what turned it off. If you
 ever need to do it by hand, run `omarchy-toggle screensaver-off off`. Afterwards you can delete
-`~/.config/gridfall` and `~/.cache/gridfall` too.
+`~/.config/gridfall` and `~/.cache/gridfall` (which also holds the build files) too.
 
 ## Credits
 
