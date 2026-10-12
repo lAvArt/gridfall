@@ -8,14 +8,15 @@ pgrep -x gridfall >/dev/null 2>&1 && exit 0
 
 root="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 bin=""
-for c in "$HOME/.cargo/bin/gridfall" "$HOME/.local/bin/gridfall" "$root/target/release/gridfall" "$(command -v gridfall 2>/dev/null)"; do
+build="${XDG_CACHE_HOME:-$HOME/.cache}/gridfall/build/release/gridfall"
+for c in "$build" "$HOME/.cargo/bin/gridfall" "$HOME/.local/bin/gridfall" "$root/target/release/gridfall" "$(command -v gridfall 2>/dev/null)"; do
   if [[ -n "$c" && -x "$c" ]]; then
     bin="$c"
     break
   fi
 done
 if [[ -z "$bin" ]]; then
-  notify-send -u normal "Gridfall" "Not built yet. Run: cargo install --locked --path $root --target-dir ~/.cache/gridfall/build" 2>/dev/null
+  notify-send -u normal "Gridfall" "Not built yet. See the Installing section of $root/README.md" 2>/dev/null
   exit 1
 fi
 
