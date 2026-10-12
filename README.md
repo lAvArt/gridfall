@@ -19,6 +19,11 @@ and a trail whose head runs into a cycle's light wall shatters, with the kill fe
 everything breaks apart into its own kind of debris. Light cycles fall apart into cubes, stars and issues into
 triangles, forks and pull requests into prisms, pushes into long slabs, and merges into green cubes.
 
+Those trails aren't just decoration. They're walls like any other: a light cycle that rides into one is derezzed,
+and a trail whose head runs into a cycle's light wall shatters, with the kill feed saying whose it was. And
+everything breaks apart into its own kind of debris. Light cycles fall apart into cubes, stars and issues into
+triangles, forks and pull requests into prisms, pushes into long slabs, and merges into green cubes.
+
 ![The arena: light cycles, event trails and the live feed](docs/media/arena.gif)
 
 After the battle the camera flies down a corridor of light toward the logo, which turns into a slowly turning
