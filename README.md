@@ -29,8 +29,10 @@ triangles, forks and pull requests into prisms, pushes into long slabs, and merg
 After the battle the camera flies down a corridor of light toward the logo, which turns into a slowly turning
 monolith with a cyan "digital twin" floating behind it, and then the whole thing loops back to the start.
 
-It's written in Rust on top of wgpu and runs at your display's refresh rate, so on a 120 Hz laptop panel it
-moves as smoothly as the rest of your desktop.
+It's written in Rust on top of wgpu and is built to stay cool. It renders on your power-saving GPU and never wakes
+a laptop's discrete graphics card. On big high-density panels it draws the 3D scene at three quarters of the
+resolution, while the text and HUD stay pin-sharp. It also takes care not to push the GPU harder than a screensaver
+should.
 
 🎬 [Watch the full two-minute loop](docs/media/gridfall-demo.mp4)
 
@@ -117,8 +119,11 @@ Here's everything you can set:
 | `drafting` | Construction lines and measurements around the logo at the start | `true` |
 | `logo_on_wallpaper` | Set to `true` if your wallpaper already has the logo on it, so it's there from the first frame | `false` |
 | `gpu` | `"auto"` renders on your power-saving GPU and leaves a laptop's discrete GPU asleep. `"high"` uses the fast one | `"auto"` |
+| `fps` | Frames per second. `"display"` follows your display's refresh rate, or give a number | automatic |
+| `render_scale` | How big the 3D scene renders, from `0.4` to `1.0` of your screen | automatic |
 
-On battery Gridfall also drops to half your display's refresh rate, so leaving your laptop idle doesn't drain it.
+By default Gridfall runs at your display's refresh rate. It drops to half that on battery, or when your panel is so
+big and fast that keeping up would make the GPU work hard (a 3200×2000 120 Hz laptop screen runs at 60 fps).
 
 ## Recording a video
 

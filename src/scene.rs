@@ -41,6 +41,7 @@ pub struct Frame {
     pub b: Vec<Vertex>,
     pub a: Vec<Vertex>,
     pub c: Vec<Vertex>, // vignette / fade
+    pub h: Vec<Vertex>, // HUD and labels: drawn at full resolution on their own layer
 }
 
 impl Frame {
@@ -50,6 +51,7 @@ impl Frame {
         self.b.clear();
         self.a.clear();
         self.c.clear();
+        self.h.clear();
     }
 }
 
@@ -241,7 +243,7 @@ impl Painter<'_> {
             .map(|i| Vertex { pos: pts[i].to_array(), col: col.to_array(), uv: uv4[i], kind, _pad: 0.0 })
             .collect();
         match layer {
-            Layer::Add | Layer::Pre => self.f.a.extend_from_slice(&verts),
+            Layer::Add | Layer::Pre => self.f.h.extend_from_slice(&verts),
             Layer::Fill => self.f.c.extend_from_slice(&verts),
         }
     }

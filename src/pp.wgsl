@@ -5,6 +5,7 @@ struct P { v: vec4<f32> }; // xy: texel step (down: src texel, blur: direction*t
 @group(0) @binding(2) var<uniform> p: P;
 @group(0) @binding(3) var t1: texture_2d<f32>;
 @group(0) @binding(4) var t2: texture_2d<f32>;
+@group(0) @binding(5) var hud: texture_2d<f32>; // full-resolution HUD layer (composite only)
 
 struct FOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -57,7 +58,7 @@ fn fs_comp(i: FOut) -> @location(0) vec4<f32> {
     let b1 = textureSampleLevel(t1, samp, i.uv, 0.0).rgb;
     let b2 = textureSampleLevel(t2, samp, i.uv, 0.0).rgb;
     // p.v.w: bloom held back while the desktop wallpaper is on screen, so it reads exactly as on the desktop
-    let hdr = scene + (b1 * 0.26 + b2 * 0.14) * (1.0 - p.v.w);
+    let hdr = scene + (b1 * 0.26 + b2 * 0.14) * (1.0 - p.v.w) + textureSampleLevel(hud, samp, i.uv, 0.0).rgb;
     // soft shoulder: highlights roll toward white-hot, shadows stay deep
     var c = vec3<f32>(1.0) - exp(-hdr * 1.35);
     c += (hash12(i.pos.xy) - 0.5) * 0.0010;

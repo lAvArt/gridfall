@@ -44,6 +44,10 @@ struct Gfx {
     config: wgpu::SurfaceConfiguration,
     floor: wgpu::RenderPipeline,
     add: wgpu::RenderPipeline,
+    hud: wgpu::RenderPipeline,
+    /// the 3D scene renders at this fraction of the window size (the HUD always at full size)
+    scale: f32,
+    capture: bool,
     alpha: wgpu::RenderPipeline,
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
@@ -70,6 +74,8 @@ fn offscreen_target(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, 
 /// Size-dependent post-processing resources (HDR scene + two-level bloom chain).
 struct Targets {
     scene: wgpu::TextureView,
+    /// full-resolution layer for the HUD and labels, added on top of the (possibly scaled) scene
+    hud: wgpu::TextureView,
     depth: wgpu::TextureView,
     passes: Vec<wgpu::BindGroup>, // down1, blurH1, blurV1, down2, blurH2, blurV2, comp
     views: [wgpu::TextureView; 4], // L1A, L1B, L2A, L2B
@@ -101,7 +107,10 @@ fn make_tex(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, w: u32, h: u32) -> Targets {
+/// `w`×`h` is the window; the 3D scene (and its bloom) render at `scale` of that, the HUD layer at full size.
+fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, w: u32, h: u32, scale: f32) -> Targets {
+    let hud = make_tex(device, w, h);
+    let (w, h) = (((w as f32 * scale).round() as u32).max(1), ((h as f32 * scale).round() as u32).max(1));
     let (w1, h1) = ((w / 4).max(1), (h / 4).max(1));
     let (w2, h2) = ((w1 / 4).max(1), (h1 / 4).max(1));
     let scene = make_tex(device, w, h);
@@ -128,7 +137,7 @@ fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &w
             usage: wgpu::BufferUsages::UNIFORM,
         })
     };
-    let bg = |src: &wgpu::TextureView, u: &wgpu::Buffer, t1: &wgpu::TextureView, t2: &wgpu::TextureView| {
+    let bg = |src: &wgpu::TextureView, u: &wgpu::Buffer, t1: &wgpu::TextureView, t2: &wgpu::TextureView, t3: &wgpu::TextureView| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: bgl,
@@ -138,6 +147,7 @@ fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &w
                 wgpu::BindGroupEntry { binding: 2, resource: u.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(t1) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(t2) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(t3) },
             ],
         })
     };
@@ -154,15 +164,15 @@ fn build_targets(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, sampler: &w
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let passes = vec![
-        bg(&scene, &u_down1, &scene, &scene),
-        bg(&l1a, &u_bh1, &scene, &scene),
-        bg(&l1b, &u_bv1, &scene, &scene),
-        bg(&l1a, &u_down2, &scene, &scene),
-        bg(&l2a, &u_bh2, &scene, &scene),
-        bg(&l2b, &u_bv2, &scene, &scene),
-        bg(&scene, &u_comp, &l1a, &l2a),
+        bg(&scene, &u_down1, &scene, &scene, &hud),
+        bg(&l1a, &u_bh1, &scene, &scene, &hud),
+        bg(&l1b, &u_bv1, &scene, &scene, &hud),
+        bg(&l1a, &u_down2, &scene, &scene, &hud),
+        bg(&l2a, &u_bh2, &scene, &scene, &hud),
+        bg(&l2b, &u_bv2, &scene, &scene, &hud),
+        bg(&scene, &u_comp, &l1a, &l2a, &hud),
     ];
-    Targets { scene, depth, passes, views: [l1a, l1b, l2a, l2b], u_comp }
+    Targets { scene, depth, hud, passes, views: [l1a, l1b, l2a, l2b], u_comp }
 }
 
 impl Gfx {
@@ -331,7 +341,7 @@ impl Gfx {
             color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
             alpha: wgpu::BlendComponent::OVER,
         };
-        let make = |label: &str, vs: &str, fs: &str, buffers: &[Option<wgpu::VertexBufferLayout>], blend: Option<wgpu::BlendState>, write: bool, always: bool| {
+        let make = |label: &str, vs: &str, fs: &str, buffers: &[Option<wgpu::VertexBufferLayout>], blend: Option<wgpu::BlendState>, write: bool, always: bool, depth: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
@@ -343,7 +353,7 @@ impl Gfx {
                     targets: &[Some(wgpu::ColorTargetState { format: HDR, blend, write_mask: wgpu::ColorWrites::ALL })],
                 }),
                 primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
+                depth_stencil: depth.then(|| wgpu::DepthStencilState {
                     format: DEPTH,
                     depth_write_enabled: Some(write),
                     depth_compare: Some(if always { wgpu::CompareFunction::Always } else { wgpu::CompareFunction::LessEqual }),
@@ -355,13 +365,14 @@ impl Gfx {
                 cache: None,
             })
         };
-        let floor = make("floor", "vs_full", "fs_floor", &[], None, false, true);
-        let add = make("add", "vs_main", "fs_main", &[Some(vlayout.clone())], Some(additive), false, false);
-        let alpha = make("alpha", "vs_main", "fs_main", &[Some(vlayout)], Some(wgpu::BlendState::ALPHA_BLENDING), true, false);
+        let floor = make("floor", "vs_full", "fs_floor", &[], None, false, true, true);
+        let add = make("add", "vs_main", "fs_main", &[Some(vlayout.clone())], Some(additive), false, false, true);
+        let hud = make("hud", "vs_main", "fs_main", &[Some(vlayout.clone())], Some(additive), false, false, false);
+        let alpha = make("alpha", "vs_main", "fs_main", &[Some(vlayout)], Some(wgpu::BlendState::ALPHA_BLENDING), true, false, true);
 
         let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("verts"),
-            size: (MAX_QUADS * 4 * 5 * std::mem::size_of::<Vertex>()) as u64,
+            size: (MAX_QUADS * 4 * 6 * std::mem::size_of::<Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -402,6 +413,7 @@ impl Gfx {
                 },
                 tex_entry(3),
                 tex_entry(4),
+                tex_entry(5),
             ],
         });
         let pp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -434,7 +446,11 @@ impl Gfx {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        let t = build_targets(&device, &pp_bgl, &pp_sampler, config.width, config.height);
+        let scale = render_scale(config.width, config.height, capture);
+        if debug() {
+            eprintln!("gridfall: scene at {:.0}% of {}x{}", scale * 100.0, config.width, config.height);
+        }
+        let t = build_targets(&device, &pp_bgl, &pp_sampler, config.width, config.height, scale);
         let post = Post {
             down: pp_make("fs_down", HDR),
             blur: pp_make("fs_blur", HDR),
@@ -445,7 +461,7 @@ impl Gfx {
         };
 
         let offscreen = capture.then(|| offscreen_target(&device, config.format, config.width, config.height));
-        Gfx { window, surface, device, queue, config, floor, add, alpha, vbuf, ibuf, ubuf, bind, post, offscreen }
+        Gfx { window, surface, device, queue, config, floor, add, hud, alpha, vbuf, ibuf, ubuf, bind, post, offscreen, scale, capture }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -457,7 +473,8 @@ impl Gfx {
             } else {
                 self.surface.configure(&self.device, &self.config);
             }
-            self.post.t = build_targets(&self.device, &self.post.bgl, &self.post.sampler, w, h);
+            self.scale = render_scale(w, h, self.capture);
+            self.post.t = build_targets(&self.device, &self.post.bgl, &self.post.sampler, w, h, self.scale);
         }
     }
 
@@ -483,9 +500,9 @@ impl Gfx {
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Upload all batches back-to-back into the one vertex buffer.
-        let batches: [&Vec<Vertex>; 5] = [&frame.m, &frame.p, &frame.b, &frame.a, &frame.c];
+        let batches: [&Vec<Vertex>; 6] = [&frame.m, &frame.p, &frame.b, &frame.a, &frame.c, &frame.h];
         let vsz = std::mem::size_of::<Vertex>() as u64;
-        let mut ranges = [(0u32, 0u32); 5];
+        let mut ranges = [(0u32, 0u32); 6];
         let mut off = 0u64;
         for (i, b) in batches.iter().enumerate() {
             let n = b.len().min(MAX_QUADS * 4);
@@ -530,6 +547,30 @@ impl Gfx {
                     continue;
                 }
                 rp.set_pipeline(if is_alpha { &self.alpha } else { &self.add });
+                rp.draw_indexed(0..quads * 6, base as i32, 0..1);
+            }
+        }
+        // HUD and labels: their own full-resolution layer, so text stays sharp when the scene renders smaller
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.post.t.hud,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let (base, quads) = ranges[5];
+            if quads > 0 {
+                rp.set_bind_group(0, &self.bind, &[]);
+                rp.set_vertex_buffer(0, self.vbuf.slice(..));
+                rp.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                rp.set_pipeline(&self.hud);
                 rp.draw_indexed(0..quads * 6, base as i32, 0..1);
             }
         }
@@ -631,6 +672,19 @@ fn on_mains() -> bool {
     !battery
 }
 
+/// How big the 3D scene renders relative to the window. Recordings always render at full size. On a big, dense
+/// panel (over ~4 megapixels, e.g. 3200×2000) the scene renders at 75%: it is upscaled softly anyway by the bloom
+/// look, and it saves the GPU almost half its work. `render_scale` in the config overrides it.
+fn render_scale(w: u32, h: u32, capture: bool) -> f32 {
+    if capture && std::env::var_os("GRIDFALL_BENCH_SCALE").is_none() {
+        return 1.0;
+    }
+    if let Some(s) = std::env::var("GRIDFALL_BENCH_SCALE").ok().and_then(|v| v.parse().ok()).or(crate::brand::get().render_scale) {
+        return (s as f32).clamp(0.4, 1.0);
+    }
+    if w as u64 * h as u64 > 4_200_000 { 0.75 } else { 1.0 }
+}
+
 fn debug() -> bool {
     std::env::var_os("GRIDFALL_DEBUG").is_some()
 }
@@ -677,9 +731,36 @@ struct Dump {
     size: (u32, u32),
     written: u32,
     ffmpeg: Option<std::process::Child>,
+    /// --bench: render off-screen as fast as the GPU goes, no video; report frames per second
+    bench: Option<Instant>,
 }
 
 impl App {
+    /// Frame pacing for the live screensaver (not --fps, not recordings). A screensaver should run cool: on battery, or
+    /// when the integrated GPU would have to push more than ~300 megapixels a second (a big, fast panel), it runs at half
+    /// the display rate; otherwise at the display rate. `fps` in the config overrides it.
+    fn pace(&mut self) {
+        if !self.adaptive || self.dump.is_some() {
+            return;
+        }
+        let Some(g) = self.gfx.as_ref() else { return };
+        if let Some(r) = g.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()) {
+            self.refresh = r as f32 / 1000.0;
+        }
+        let scene_px = g.config.width as f32 * g.config.height as f32 * g.scale * g.scale;
+        let heavy = !want_fast_gpu() && scene_px * self.refresh > 300e6;
+        self.frame_dt = match crate::brand::get().fps.as_deref() {
+            Some("display") => Duration::ZERO,
+            Some(n) if n.parse::<f32>().is_ok() => Duration::from_secs_f32(1.0 / n.parse::<f32>().unwrap().clamp(10.0, 240.0)),
+            _ if (heavy || !on_mains()) && self.refresh >= 90.0 => Duration::from_secs_f32(1.0 / (self.refresh * 0.5)),
+            _ => Duration::ZERO,
+        };
+        if debug() {
+            let f = if self.frame_dt.is_zero() { self.refresh } else { 1.0 / self.frame_dt.as_secs_f32() };
+            eprintln!("gridfall: {}x{} at {:.0}% on a {:.0} Hz display: {:.0} fps", g.config.width, g.config.height, g.scale * 100.0, self.refresh, f);
+        }
+    }
+
     fn quit(&self, el: &ActiveEventLoop) {
         // Input lands on one monitor's instance only; take the other screensaver instances down with us (same binary,
         // whatever it is called), but leave recordings and windowed previews running.
@@ -765,7 +846,12 @@ impl App {
         let fmt = g.config.format;
         let (gw, gh) = (g.config.width, g.config.height);
         let t2 = Instant::now();
-        let px = g.draw(&self.scene.frame, &uni, self.dump.is_some());
+        let bench = self.dump.as_ref().is_some_and(|d| d.path.is_empty());
+        let px = g.draw(&self.scene.frame, &uni, self.dump.is_some() && !bench);
+        if bench {
+            // wait for the GPU, so the frame rate measures real GPU work, not queued-up submissions
+            let _ = g.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        }
         let t3 = Instant::now();
         self.prof.build += (t2 - t1).as_secs_f32() * 1000.0;
         self.prof.draw += (t3 - t2).as_secs_f32() * 1000.0;
@@ -787,6 +873,21 @@ impl App {
                 gh
             );
             self.prof = Prof { n: 0, upd: 0.0, build: 0.0, draw: 0.0, since: t3 };
+        }
+        if let Some(d) = self.dump.as_mut().filter(|d| d.path.is_empty()) {
+            d.frame += 1;
+            if d.frame == 30 {
+                d.bench = Some(Instant::now());
+            }
+            if d.frame > 30 {
+                d.written += 1;
+            }
+            if d.written as f32 >= d.secs * 60.0 {
+                let s = d.bench.map(|b| b.elapsed().as_secs_f32()).unwrap_or(1.0);
+                println!("gridfall bench: {:.1} fps over {} frames at {}x{} (scene at {:.0}%)", d.written as f32 / s, d.written, gw, gh, g.scale * 100.0);
+                el.exit();
+            }
+            return;
         }
         if let Some(d) = self.dump.as_mut() {
             d.frame += 1;
@@ -841,14 +942,15 @@ impl ApplicationHandler for App {
             attrs = attrs.with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
         }
         let window = Arc::new(el.create_window(attrs).expect("window"));
-        self.refresh = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).map(|r| r as f32 / 1000.0).unwrap_or(60.0);
-        if self.adaptive && self.dump.is_none() && !on_mains() && self.refresh >= 90.0 {
-            self.frame_dt = Duration::from_secs_f32(1.0 / (self.refresh * 0.5));
-        }
+        // a Wayland window only knows its monitor once it is mapped: until then, assume the fastest connected one
+        let hz = |m: winit::monitor::MonitorHandle| m.refresh_rate_millihertz().map(|r| r as f32 / 1000.0);
+        self.refresh = window.current_monitor().and_then(hz).or_else(|| el.available_monitors().filter_map(hz).reduce(f32::max)).unwrap_or(60.0);
+
         if !self.windowed {
             window.set_cursor_visible(false);
         }
         self.gfx = Some(Gfx::new(window, &self.scene.atlas, self.dump.is_some()));
+        self.pace();
         if let (Some(g), Some(d)) = (self.gfx.as_mut(), &self.dump) {
             g.resize(d.size.0, d.size.1);
         }
@@ -869,6 +971,7 @@ impl ApplicationHandler for App {
                 if let Some(g) = self.gfx.as_mut() {
                     g.resize(w, h);
                 }
+                self.pace();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if self.windowed {
@@ -955,13 +1058,14 @@ fn main() {
         fps: fps.unwrap_or(60.0) as f32,
         pointer0: None,
         grace_until: now,
-        dump: args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(|p| Dump {
-            path: p.clone(),
+        dump: args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).cloned().or_else(|| args.iter().any(|a| a == "--bench").then(String::new)).map(|p| Dump {
+            path: p,
             secs: args.iter().position(|a| a == "--secs").and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(60.0),
             frame: 0,
             size: args.iter().position(|a| a == "--size").and_then(|i| args.get(i + 1)).and_then(|v| v.split_once('x')).and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))).unwrap_or((1920, 1080)),
             written: 0,
             ffmpeg: None,
+            bench: None,
         }),
     };
     // --record: hold the light-cycle arena and cycle its camera angles, with a larger HUD for a downscaled video

@@ -384,6 +384,10 @@ pub struct Brand {
     pub mark_offset: f32,
     /// "auto"/"low": the integrated, power-saving GPU (the discrete one stays asleep); "high": the fast one
     pub gpu: String,
+    /// fraction of the window size the 3D scene renders at (None = automatic)
+    pub render_scale: Option<f64>,
+    /// frame rate: None = automatic, "display" = the display's refresh rate, or a number
+    pub fps: Option<String>,
 }
 
 static BRAND: OnceLock<Brand> = OnceLock::new();
@@ -510,6 +514,8 @@ fn load(args: &[String]) -> Brand {
         drafting: b("drafting", true),
         logo_on_wallpaper: b("logo_on_wallpaper", lavart),
         gpu: s("gpu").unwrap_or_else(|| "auto".into()),
+        render_scale: cfg.get("render_scale").and_then(|v| v.as_f64()),
+        fps: cfg.get("fps").and_then(|v| v.as_str().map(String::from).or_else(|| v.as_f64().map(|n| n.to_string()))),
         mark_offset: cfg.get("mark_offset").and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(if lavart { 0.32 } else { 0.0 }),
     }
 }
