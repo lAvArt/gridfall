@@ -42,7 +42,9 @@ Gridfall has two styles, and you pick the one you like. The default is the 3D ar
 same battle the way a 1990s text-mode terminal would have: every light cycle, trail, GitHub event and puff of debris is
 a character on a grid, seen through a CRT with curved glass, scanlines and phosphor glow.
 
-![The ASCII style: the light-cycle battle on a text-mode screen](docs/media/06-ascii-arena.jpg)
+![The ASCII style booting: BIOS lines, then the logo traced out of characters](docs/media/ascii-opening.gif)
+
+🎬 [Watch the full ASCII loop](docs/media/ascii-demo.mp4)
 
 It opens on a BIOS boot screen that traces your logo out of characters, then drops into the arena, with the score,
 the event log, a kill feed and the legend in panels beside it. After a couple of minutes the battle ends with an
