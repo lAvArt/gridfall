@@ -24,20 +24,30 @@ fi
 focus_monitor() {
   hyprctl dispatch "hl.dsp.focus({ monitor = \"$1\" })" >/dev/null 2>&1 || hyprctl dispatch focusmonitor "$1" >/dev/null 2>&1
 }
+# Omarchy's window rules park org.omarchy.screensaver on a silent special workspace, where it stays invisible.
+# Like omarchy-launch-screensaver, name the monitor's own special workspace in the exec rule so the window shows.
+# Reuse a special workspace that is already open (e.g. the scratchpad) so it is still there afterwards.
 hypr_exec() {
-  local cmd
+  local cmd ws="$WS"
   printf -v cmd '%q ' "$@"
-  hyprctl dispatch "hl.dsp.exec_cmd([[$cmd]])" >/dev/null 2>&1 || hyprctl dispatch exec -- "$cmd" >/dev/null 2>&1
+  if [[ -n "$ws" ]]; then
+    hyprctl dispatch "hl.dsp.exec_cmd([[[workspace $ws] $cmd]])" >/dev/null 2>&1 ||
+      hyprctl dispatch exec -- "[workspace $ws] $cmd" >/dev/null 2>&1
+  else
+    hyprctl dispatch "hl.dsp.exec_cmd([[$cmd]])" >/dev/null 2>&1 || hyprctl dispatch exec -- "$cmd" >/dev/null 2>&1
+  fi
 }
 
 focused=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null)
-monitors=$(hyprctl monitors -j 2>/dev/null | jq -r '.[].name' 2>/dev/null)
+monitors=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | "\(.name) \(.specialWorkspace.name)"' 2>/dev/null)
 if [[ -z "$monitors" ]]; then
   "$bin" "$@" >/dev/null 2>&1 &
   exit 0
 fi
 count() { hyprctl clients -j 2>/dev/null | jq '[.[] | select(.class == "org.omarchy.screensaver")] | length' 2>/dev/null || echo 0; }
-for m in $monitors; do
+while read -r m special; do
+  [[ -z "$m" ]] && continue
+  WS=${special:-special:screensaver-$m}
   n0=$(count)
   focus_monitor "$m"
   hypr_exec "$bin" "$@"
@@ -46,6 +56,6 @@ for m in $monitors; do
     sleep 0.1
     (($(count) > n0)) && break
   done
-done
+done <<<"$monitors"
 [[ -n "$focused" ]] && focus_monitor "$focused"
 exit 0
