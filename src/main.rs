@@ -1,6 +1,7 @@
 //! Gridfall — the desktop falls into a light-cycle grid. A screensaver by lAvArt Studio.
 //! Tron: Ares–style grid world: GPU-rendered, CPU physics, ~one draw call per layer.
 
+mod ascii;
 mod brand;
 mod feed;
 mod scene;
@@ -534,8 +535,11 @@ impl Gfx {
                 multiview_mask: None,
             });
             rp.set_bind_group(0, &self.bind, &[]);
-            rp.set_pipeline(&self.floor);
-            rp.draw(0..3, 0..1);
+            // the ASCII style is plain black text: no perspective floor behind it
+            if !ascii_style() {
+                rp.set_pipeline(&self.floor);
+                rp.draw(0..3, 0..1);
+            }
 
             rp.set_vertex_buffer(0, self.vbuf.slice(..));
             rp.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -577,7 +581,9 @@ impl Gfx {
         // bloom chain: bright-down → blur (¼ res) → down → blur (1/16 res) → composite
         {
             let t = &self.post.t;
-            self.queue.write_buffer(&t.u_comp, 0, bytemuck::cast_slice(&[0.0f32, 0.0, 0.0, uni.wall[0]]));
+            // x: CRT look on (ASCII style), y: time for its flicker, w: bloom hold-back
+            let crt = if ascii_style() && crate::brand::get().crt { 1.0f32 } else { 0.0 };
+            self.queue.write_buffer(&t.u_comp, 0, bytemuck::cast_slice(&[crt, uni.params[0], 0.0, uni.wall[0]]));
             let fs_pass = |enc: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, pipe: &wgpu::RenderPipeline, bg: &wgpu::BindGroup| {
                 let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: None,
@@ -676,6 +682,10 @@ fn on_mains() -> bool {
 /// panel (over ~4 megapixels, e.g. 3200×2000) the scene renders at 75%: it is upscaled softly anyway by the bloom
 /// look, and it saves the GPU almost half its work. `render_scale` in the config overrides it.
 fn render_scale(w: u32, h: u32, capture: bool) -> f32 {
+    // characters stay crisp only at full size, and there is no 3D scene to save work on
+    if ascii_style() {
+        return 1.0;
+    }
     if capture && std::env::var_os("GRIDFALL_BENCH_SCALE").is_none() {
         return 1.0;
     }
@@ -683,6 +693,11 @@ fn render_scale(w: u32, h: u32, capture: bool) -> f32 {
         return (s as f32).clamp(0.4, 1.0);
     }
     if w as u64 * h as u64 > 4_200_000 { 0.75 } else { 1.0 }
+}
+
+/// `style: "ascii"` in the config (or `--style ascii`): the text-mode terminal look instead of the 3D arena.
+fn ascii_style() -> bool {
+    crate::brand::get().style == "ascii"
 }
 
 fn debug() -> bool {
@@ -703,6 +718,8 @@ struct App {
     gfx: Option<Gfx>,
     scene: Scene,
     sim: sim::Sim,
+    /// the ASCII style's screen sequence (None in the 3D style)
+    ascii: Option<ascii::Ascii>,
     windowed: bool,
     /// test/preview only: ignore input so a capture isn't interrupted
     keep: bool,
@@ -793,6 +810,9 @@ impl App {
         self.sim.aspect = self.gfx.as_ref().map(|g| g.config.width as f32 / g.config.height as f32).unwrap_or(1.6);
         let t0 = Instant::now();
         self.sim.update(dt);
+        if let Some(a) = self.ascii.as_mut() {
+            a.update(&mut self.sim, dt);
+        }
         self.prof.upd += t0.elapsed().as_secs_f32() * 1000.0;
 
         self.fps_acc.0 += 1;
@@ -815,7 +835,12 @@ impl App {
         let (w, h) = (g.config.width as f32, g.config.height as f32);
         let fade = (t / 1.6).clamp(0.0, 1.0);
         let t1 = Instant::now();
-        let (cam, pu, pc) = self.scene.build(&self.sim, t, w, h, if self.dump.is_some() { 60.0 } else { self.fps }, fade * fade * (3.0 - 2.0 * fade));
+        let (cam, pu, pc) = if let Some(a) = self.ascii.as_mut() {
+            a.build(&self.sim, &self.scene.atlas, &mut self.scene.frame, w, h);
+            (scene::Camera { vp: glam::Mat4::IDENTITY, eye: glam::Vec3::ZERO }, [glam::Vec4::ZERO; 4], [glam::Vec4::ZERO; 4])
+        } else {
+            self.scene.build(&self.sim, t, w, h, if self.dump.is_some() { 60.0 } else { self.fps }, fade * fade * (3.0 - 2.0 * fade))
+        };
         let uni = Uniforms {
             inv_vp: cam.vp.inverse().to_cols_array_2d(),
             eye: cam.eye.extend(1.0).to_array(),
@@ -1044,6 +1069,7 @@ fn main() {
         gfx: None,
         scene: Scene::new(),
         sim: sim::Sim::new(seed),
+        ascii: ascii_style().then(ascii::Ascii::new),
         windowed,
         keep: args.iter().any(|a| a == "--keep"),
         start: now,
@@ -1068,6 +1094,11 @@ fn main() {
             bench: None,
         }),
     };
+    // the ASCII style has no opening or camera work: it stays in the arena and runs its own screen sequence
+    if app.ascii.is_some() {
+        app.sim.hold_arena = true;
+        app.sim.jump(sim::Scenario::Arena);
+    }
     // --record: hold the light-cycle arena and cycle its camera angles, with a larger HUD for a downscaled video
     if args.iter().any(|a| a == "--record") {
         app.sim.hold_arena = true;

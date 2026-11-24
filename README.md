@@ -19,11 +19,6 @@ and a trail whose head runs into a cycle's light wall shatters, with the kill fe
 everything breaks apart into its own kind of debris. Light cycles fall apart into cubes, stars and issues into
 triangles, forks and pull requests into prisms, pushes into long slabs, and merges into green cubes.
 
-Those trails aren't just decoration. They're walls like any other: a light cycle that rides into one is derezzed,
-and a trail whose head runs into a cycle's light wall shatters, with the kill feed saying whose it was. And
-everything breaks apart into its own kind of debris. Light cycles fall apart into cubes, stars and issues into
-triangles, forks and pull requests into prisms, pushes into long slabs, and merges into green cubes.
-
 ![The arena: light cycles, event trails and the live feed](docs/media/arena.gif)
 
 After the battle the camera flies down a corridor of light toward the logo, which turns into a slowly turning
@@ -40,6 +35,39 @@ should.
 |---|---|
 | ![Your wallpaper, with the logo drawn onto it](docs/media/01-desktop.jpg) | ![The logo rising out of its own wireframe](docs/media/02-rise.jpg) |
 | ![The light-cycle arena](docs/media/03-arena.jpg) | ![The monolith and its digital twin](docs/media/04-twin.jpg) |
+
+## Two looks: 3D or ASCII
+
+Gridfall has two styles, and you pick the one you like. The default is the 3D arena above. The other draws the very
+same battle the way a 1990s text-mode terminal would have: every light cycle, trail, GitHub event and puff of debris is
+a character on a grid, seen through a CRT with curved glass, scanlines and phosphor glow.
+
+![The ASCII style: the light-cycle battle on a text-mode screen](docs/media/06-ascii-arena.jpg)
+
+It opens on a BIOS boot screen that traces your logo out of characters, then drops into the arena, with the score,
+the event log, a kill feed and the legend in panels beside it. After a couple of minutes the battle ends with an
+`END OF LINE` screen and starts over. Whatever logo you use shows up too, in characters, because it is traced from the
+logo's own shapes.
+
+| | |
+|---|---|
+| ![The boot screen drawing the logo](docs/media/07-ascii-boot.jpg) | ![The arena at full size](docs/media/06-ascii-arena.jpg) |
+
+To switch, put this in `~/.config/gridfall/config.json`:
+
+```json
+{ "style": "ascii" }
+```
+
+To just look at it first, without changing anything:
+
+```bash
+~/.config/omarchy/plugins/io.github.lavart.gridfall/bin/gridfall-launch --style ascii
+```
+
+The ASCII style uses your `teams` colours, `logo`, `name`, `tagline`, `footer` and `repo`. It doesn't use the wallpaper,
+`accent` or `drafting`, since there is no desktop to fall into. If you'd rather have a clean screen without the glass
+effects, set `"crt": false`. It's also the lighter of the two on the GPU.
 
 ## Installing
 
@@ -118,6 +146,8 @@ Here's everything you can set:
 | `teams` | The two light-cycle colours | red and blue |
 | `drafting` | Construction lines and measurements around the logo at the start | `true` |
 | `logo_on_wallpaper` | Set to `true` if your wallpaper already has the logo on it, so it's there from the first frame | `false` |
+| `style` | `"grid"` is the 3D arena. `"ascii"` is the same battle on a 90s text-mode terminal screen | `"grid"` |
+| `crt` | In the ASCII style, the curved glass, scanlines and flicker | `true` |
 | `gpu` | `"auto"` renders on your power-saving GPU and leaves a laptop's discrete GPU asleep. `"high"` uses the fast one | `"auto"` |
 | `fps` | Frames per second. `"display"` follows your display's refresh rate, or give a number | automatic |
 | `render_scale` | How big the 3D scene renders, from `0.4` to `1.0` of your screen | automatic |

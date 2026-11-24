@@ -58,12 +58,12 @@ impl Frame {
 // ───────────────────────── glyph atlas ─────────────────────────
 #[derive(Clone, Copy)]
 pub struct Glyph {
-    u0: f32,
-    v0: f32,
-    du: f32,
-    dv: f32,
+    pub u0: f32,
+    pub v0: f32,
+    pub du: f32,
+    pub dv: f32,
     /// advance as a fraction of the glyph cell's edge
-    adv: f32,
+    pub adv: f32,
 }
 
 pub struct Atlas {
@@ -89,6 +89,11 @@ fn blit(data: &mut [u8], aw: u32, cx: u32, cy: u32, cell: u32, base: i32, m: &fo
 }
 
 impl Atlas {
+    /// A glyph of the monospace HUD face.
+    pub fn mono(&self, ch: char) -> Option<Glyph> {
+        self.map.get(&(F_MONO, ch)).copied()
+    }
+
     pub fn build() -> Self {
         // region A: HUD monospace, 48px cells · region B: display face for the lockup, 128px cells
         const CA: u32 = 48;

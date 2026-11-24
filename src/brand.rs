@@ -388,6 +388,10 @@ pub struct Brand {
     pub render_scale: Option<f64>,
     /// frame rate: None = automatic, "display" = the display's refresh rate, or a number
     pub fps: Option<String>,
+    /// "grid" (the 3D light-cycle arena) or "ascii" (the same battle as a 90s text-mode terminal)
+    pub style: String,
+    /// ascii style: CRT curvature, scanlines and flicker
+    pub crt: bool,
 }
 
 static BRAND: OnceLock<Brand> = OnceLock::new();
@@ -516,6 +520,15 @@ fn load(args: &[String]) -> Brand {
         gpu: s("gpu").unwrap_or_else(|| "auto".into()),
         render_scale: cfg.get("render_scale").and_then(|v| v.as_f64()),
         fps: cfg.get("fps").and_then(|v| v.as_str().map(String::from).or_else(|| v.as_f64().map(|n| n.to_string()))),
+        style: match s("style").as_deref() {
+            Some("ascii") => "ascii".into(),
+            Some("grid") | None => "grid".into(),
+            Some(other) => {
+                eprintln!("gridfall: unknown style {other:?} (use \"grid\" or \"ascii\"); using grid");
+                "grid".into()
+            }
+        },
+        crt: b("crt", true),
         mark_offset: cfg.get("mark_offset").and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(if lavart { 0.32 } else { 0.0 }),
     }
 }

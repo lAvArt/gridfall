@@ -8,6 +8,8 @@
   "repo": "omacom/omarchy",
   "accent": "auto",
   "teams": ["#ff2919", "#0d80ff"],
+  "style": "grid",
+  "crt": true,
   "drafting": true,
   "desktop_grid": false,
   "logo_on_wallpaper": false,
